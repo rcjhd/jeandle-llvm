@@ -11,14 +11,14 @@
 ; new materialized pointer. The outer allocation disappears.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
-declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32)
+declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
 define void @test_virtualref_on_load_then_escape() gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
   %inner = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(
-              ptr inttoptr (i64 12345 to ptr), i32 4)
+              ptr inttoptr (i64 12345 to ptr), i32 4, i32 32, i32 16, i32 1048576)
            to label %nA unwind label %u1
 nA:
   %outer = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
@@ -42,7 +42,7 @@ u2:
 ; The outer (klass 67890) is fully eliminated.
 ; CHECK-NOT: i64 67890
 ; A materialization for the inner (klass 12345) is emitted.
-; CHECK: %[[MAT:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 12345 to ptr), i32 4)
+; CHECK: %[[MAT:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 12345 to ptr), i32 4, i32 32, i32 16, i32 1048576)
 ; CHECK-NEXT: to label %{{.*}} unwind label %{{.*}}
 ; The sink receives the newly materialized pointer, not the original load result.
 ; CHECK: call void @sink(ptr addrspace(1) %[[MAT]])

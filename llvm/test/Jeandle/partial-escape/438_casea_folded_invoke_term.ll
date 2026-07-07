@@ -12,14 +12,14 @@
 ; applyMaterialize's InsertBefore-null assert fires (the old unsound fallback
 ; hoisted to the normal-dest head).
 
-declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32)
+declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
 declare hotspotcc i32 @jeandle.arraylength(ptr addrspace(1) readonly)
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
 define void @casea_folded_invoke_term(i1 %c) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
-  %o = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 12345 to ptr), i32 7)
+  %o = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 12345 to ptr), i32 7, i32 44, i32 16, i32 1048576)
          to label %n unwind label %u
 n:
   br i1 %c, label %then, label %else
@@ -52,7 +52,7 @@ u:
 ; The materialization lands at the end of `else` (re-aimed off the erased
 ; arraylength-invoke terminator onto the `br`), not at %o's alloc normal-dest.
 ; CHECK: else:
-; CHECK-NEXT: %{{.*}} = invoke hotspotcc{{.*}}@jeandle.new_array(ptr inttoptr (i64 12345 to ptr), i32 7)
+; CHECK-NEXT: %{{.*}} = invoke hotspotcc{{.*}}@jeandle.new_array(ptr inttoptr (i64 12345 to ptr), i32 7, i32 44, i32 16, i32 1048576)
 ; CHECK-NEXT: to label %mat.cont unwind label %u
 ; CHECK: mat.cont:
 ; CHECK-NEXT: br label %merge

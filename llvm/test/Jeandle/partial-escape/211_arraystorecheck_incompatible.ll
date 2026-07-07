@@ -8,7 +8,7 @@
 ; on a non-deleted node) — BOTH the array and the virtual value operand
 ; materialize, so the surviving array_store_check observes real pointers.
 
-declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32)
+declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc i1 @jeandle.array_store_check(ptr addrspace(1), ptr addrspace(1))
 
@@ -17,7 +17,7 @@ declare i32 @__gxx_personality_v0(...)
 define i1 @test_storecheck_incompat() gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
   %arr = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(
-            ptr inttoptr (i64 8888 to ptr), i32 4)
+            ptr inttoptr (i64 8888 to ptr), i32 4, i32 32, i32 16, i32 1048576)
          to label %n1 unwind label %u
 n1:
   %v = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(

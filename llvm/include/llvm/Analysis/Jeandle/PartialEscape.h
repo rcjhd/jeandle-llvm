@@ -164,6 +164,7 @@ public:
   Type *ArrayElementType = nullptr;
   uint32_t ArrayIndexScale = 0;
   uint32_t ArrayBaseOffset = 0;
+  uint32_t ArrayLengthLimit = 0;
 
   SmallVector<FieldDesc, 8> Fields;
 

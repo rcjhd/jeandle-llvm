@@ -11,7 +11,7 @@
 ; Byte-offset element access (no VM callback log needed: the typed-GEP matcher
 ; is inert without ArrayElementType, so accesses resolve via constant offsets).
 
-declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32)
+declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
 declare void @use(i32)
 declare i32 @__gxx_personality_v0(...)
 
@@ -21,7 +21,7 @@ entry:
   br i1 %c, label %left, label %right
 left:
   %a1 = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(
-            ptr inttoptr (i64 12345 to ptr), i32 4)
+            ptr inttoptr (i64 12345 to ptr), i32 4, i32 32, i32 16, i32 1048576)
         to label %lstore unwind label %u
 lstore:
   %l = getelementptr inbounds i8, ptr addrspace(1) %a1, i64 16
@@ -29,7 +29,7 @@ lstore:
   br label %merge
 right:
   %a2 = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(
-            ptr inttoptr (i64 12345 to ptr), i32 4)
+            ptr inttoptr (i64 12345 to ptr), i32 4, i32 32, i32 16, i32 1048576)
         to label %rstore unwind label %u
 rstore:
   %r = getelementptr inbounds i8, ptr addrspace(1) %a2, i64 24

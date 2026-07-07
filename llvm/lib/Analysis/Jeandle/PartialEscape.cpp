@@ -263,6 +263,7 @@ void VirtualObject::copyStructuralFieldsFrom(const VirtualObject &O) {
   ArrayElementType = O.ArrayElementType;
   ArrayIndexScale = O.ArrayIndexScale;
   ArrayBaseOffset = O.ArrayBaseOffset;
+  ArrayLengthLimit = O.ArrayLengthLimit;
   Fields = O.Fields;
 }
 

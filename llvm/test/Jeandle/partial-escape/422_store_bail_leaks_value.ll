@@ -15,14 +15,14 @@
 ; through to the gate, which materializes BOTH %arr and %v so the store keeps
 ; the live %v pointer.
 
-declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32)
+declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare i32 @__gxx_personality_v0(...)
 
 define void @test_store_bail_leaks_value(i64 %idx) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
   %arr = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(
-  ptr inttoptr (i64 22222 to ptr), i32 4)
+  ptr inttoptr (i64 22222 to ptr), i32 4, i32 32, i32 16, i32 1048576)
   to label %n unwind label %u
 n:
   %v = call hotspotcc ptr addrspace(1) @jeandle.new_instance(

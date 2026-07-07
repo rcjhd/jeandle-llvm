@@ -8,22 +8,21 @@
 ; `*Offset < 0` — a raw header GEP at offset 4 (the mark/klass region) would
 ; pass and be virtualized as Java field offset 0, which is unsound (VM
 ; metadata corruption once the unsafe raw-header path opens). With the fix,
-; processAllocation sets ArrayBaseOffset to the VM's standard array base
-; offset for an unknown kind (arrayBaseOffsetFor(JBasicType::Object) = 16,
-; the uniform 16-byte default across all element kinds in VMConstants.h and
-; HotSpot), so the guard `4 < 16` rejects the header store while element
-; GEPs (offset >= 16, see test 397) still virtualize. The array stays real.
+; processAllocation keeps the base_offset carried by the 5-arg new_array
+; protocol (16 here), so the guard `4 < 16` rejects the header store while
+; element GEPs (offset >= 16, see test 397) still virtualize. The array
+; stays real.
 
-declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32)
+declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
 define void @test_array_header_guard_unknown_kind() gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
   ; Klass 7777 is NOT registered with any cblog -> element kind unknown ->
-  ; without the fix ArrayBaseOffset stays 0; with the fix it defaults to 16.
+  ; without the fix ArrayBaseOffset stays 0; with the fix it comes from the protocol (16).
   %arr = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(
-            ptr inttoptr (i64 7777 to ptr), i32 4)
+            ptr inttoptr (i64 7777 to ptr), i32 4, i32 32, i32 16, i32 1048576)
          to label %n unwind label %u
 n:
   ; Raw i8 GEP into the array header (offset 4 < 16).

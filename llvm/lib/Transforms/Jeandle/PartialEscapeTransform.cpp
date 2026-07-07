@@ -276,26 +276,18 @@ static void applyMaterialize(
       ConstantInt::get(Type::getInt64Ty(Ctx),
                        static_cast<uint64_t>(VObj.Klass)),
       PointerType::get(Ctx, /*AS=*/0));
-  Value *Arg1 =
-      ConstantInt::get(Type::getInt32Ty(Ctx),
-                       VObj.isInstance() ? VObj.SizeInBytes : VObj.ArrayLength);
-  // Forward any trailing allocation parameters verbatim from the original
-  // allocation invoke. `jeandle.new_instance` takes (klass, size_in_bytes); the
-  // 2 args above are the whole signature. `jeandle.new_array` now takes
-  // (klass, length, size_in_bytes, base_offset, length_limit) — the extra
-  // params describe the TLAB fast-path allocation shape and are not carried on
-  // VirtualObject. PEA only virtualizes constant-length arrays, so they are
-  // ConstantInts at the allocation site that dominate every materialization
-  // point; OrigAlloc is kept alive (and its args untouched) until
-  // EliminateAllocation, so forwarding is SSA-safe. Building to AllocFn's arity
-  // also keeps the re-emitted invoke's argument attrs aligned with the
-  // OrigAttrs copy in Step 6 (which carries per-param attrs for every param).
-  SmallVector<Value *, 4> Args = {Arg0, Arg1};
-  unsigned AllocArity = AllocFn->getFunctionType()->getNumParams();
-  for (unsigned I = Args.size(); I < AllocArity; ++I) {
-    assert(I < OrigAlloc->arg_size() &&
-           "allocation arity exceeds the original invoke's argument count");
-    Args.push_back(OrigAlloc->getArgOperand(I));
+  Type *I32 = Type::getInt32Ty(Ctx);
+  SmallVector<Value *, 5> AllocArgs;
+  AllocArgs.push_back(Arg0);
+  if (VObj.isInstance()) {
+    AllocArgs.push_back(ConstantInt::get(I32, VObj.SizeInBytes));
+  } else {
+    assert(AllocFn->arg_size() == 5 &&
+           "jeandle.new_array must use the 5-arg protocol");
+    AllocArgs.push_back(ConstantInt::get(I32, VObj.ArrayLength));
+    AllocArgs.push_back(ConstantInt::get(I32, VObj.SizeInBytes));
+    AllocArgs.push_back(ConstantInt::get(I32, VObj.ArrayBaseOffset));
+    AllocArgs.push_back(ConstantInt::get(I32, VObj.ArrayLengthLimit));
   }
 
   // Step 3: determine the enclosing EH funclet pad of the materialization site
@@ -368,17 +360,17 @@ static void applyMaterialize(
   if (InsertBefore->getDebugLoc())
     B.SetCurrentDebugLocation(InsertBefore->getDebugLoc());
   InvokeInst *NewInv = B.CreateInvoke(AllocFn, /*NormalDest=*/MatCont,
-                                      /*UnwindDest=*/UnwindDest, Args,
+                                      /*UnwindDest=*/UnwindDest, AllocArgs,
                                       Bundles, "pea.mat");
   NewInv->setCallingConv(CallingConv::Hotspot_JIT);
   // Copy metadata and merge attrs from the original allocation so downstream
   // RewriteStatepointsForGC / GC barriers don't see weaker output (lost
   // !prof, !alias.scope, !noalias, !jeandle.bytecodeindex, nofree/nosync/cold).
   // Metadata first; addRetAttr below then takes precedence. The re-emitted
-  // invoke matches the original allocation's full arity (klass + size/length
-  // rebuilt from VirtualObject; trailing params forwarded from OrigAlloc in
-  // Step 2), so the per-param argument attrs in OrigAttrs align one-to-one and
-  // are safe to reuse; return attrs are added explicitly below.
+  // invoke is rebuilt from VirtualObject structural fields and matches the
+  // allocation function's full arity, so the per-param argument attrs in
+  // OrigAttrs align one-to-one and are safe to reuse; return attrs are added
+  // explicitly below.
   NewInv->copyMetadata(*OrigAlloc, /*WL=*/{});
   AttributeList OrigAttrs = OrigAlloc->getAttributes();
   AttributeList CurAttrs = NewInv->getAttributes();

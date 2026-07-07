@@ -2564,9 +2564,13 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
         return false;
       if (VO.ArrayLength != Ref.ArrayLength)
         return false;
+      if (VO.SizeInBytes != Ref.SizeInBytes)
+        return false;
       if (VO.ArrayIndexScale != Ref.ArrayIndexScale)
         return false;
       if (VO.ArrayBaseOffset != Ref.ArrayBaseOffset)
+        return false;
+      if (VO.ArrayLengthLimit != Ref.ArrayLengthLimit)
         return false;
     }
   }
@@ -3260,6 +3264,9 @@ void Analyzer::processAllocation(CallBase *CB) {
   const bool IsArray = jeandle::pea::isJeandleNewArray(CB);
   assert((IsInstance ^ IsArray) &&
          "allocation must be either instance or array");
+  assert((!IsArray || CB->arg_size() == 5) &&
+         "jeandle.new_array must use the 5-arg protocol");
+  (void)IsArray;
 
   // Refuse to virtualize identity-sensitive allocations.
   // HasFinalizer: classes that override finalize() require HotSpot's
@@ -3303,45 +3310,36 @@ void Analyzer::processAllocation(CallBase *CB) {
         jeandle::InvalidObjectID, jeandle::VirtualObject::Array, CB);
     VO->Klass = Klass;
     VO->ArrayLength = *Length;
+    auto *Size = dyn_cast<ConstantInt>(CB->getArgOperand(2));
+    auto *BaseOffset = dyn_cast<ConstantInt>(CB->getArgOperand(3));
+    auto *LengthLimit = dyn_cast<ConstantInt>(CB->getArgOperand(4));
+    if (!Size || !BaseOffset || !LengthLimit)
+      return;
+    VO->SizeInBytes = static_cast<uint32_t>(Size->getZExtValue());
+    VO->ArrayBaseOffset = static_cast<uint32_t>(BaseOffset->getZExtValue());
+    VO->ArrayLengthLimit = static_cast<uint32_t>(LengthLimit->getZExtValue());
+
     // Populate per-element metadata so matchArrayElementGEP can match
-    // typed-GEP / symbolic-byte-offset element accesses. If the VMCallback
-    // is unregistered or cannot identify the element kind, leave
-    // ArrayElementType nullptr — matchArrayElementGEP will refuse to fire
-    // and only constant-byte-offset element accesses (handled directly by
-    // resolveFieldOffset) will be eligible. ArrayBaseOffset is always set
-    // (per-kind when known, else the VM's Object-kind default) so the
-    // resolveAccess header guard never degrades to `< 0`.
+    // typed-GEP / symbolic-byte-offset element accesses. The 5-arg
+    // new_array protocol carries ArrayBaseOffset directly; when the
+    // element kind is known, VMConstants are used only to derive the
+    // element scale and to assert the frontend-provided base offset agrees
+    // with the VM layout. If the VMCallback is unregistered or cannot
+    // identify the element kind, leave ArrayElementType nullptr and keep
+    // the protocol-provided ArrayBaseOffset so the resolveAccess header
+    // guard remains precise.
     const jeandle::VMConstants VMConsts =
         jeandle::VMConstants::fromModule(*F.getParent());
     if (auto Kind = jeandle::pea::elementTypeForArrayKlass(Klass)) {
-      // VMConstants are read out of the module's runtime-defined globals
-      // (patched by HotSpot's
-      // RuntimeDefinedJavaOps::define_global_variables); see
-      // llvm/IR/Jeandle/VMConstants.h for the delivery model. Lit tests
-      // that never link the template module fall through to the
-      // compile-time defaults declared on `struct VMConstants`.
-      VO->ArrayBaseOffset =
-          static_cast<uint32_t>(VMConsts.arrayBaseOffsetFor(*Kind));
       if (Type *ElemTy =
               jeandle::pea::llvmElementTypeFor(*Kind, F.getContext())) {
         VO->ArrayElementType = ElemTy;
+        assert(VO->ArrayBaseOffset ==
+                   static_cast<uint32_t>(VMConsts.arrayBaseOffsetFor(*Kind)) &&
+               "new_array base_offset must match VM array layout");
         VO->ArrayIndexScale =
             static_cast<uint32_t>(VMConsts.elementSizeFor(*Kind));
       }
-    } else {
-      // Unknown element kind: we cannot pin the per-kind element type, but
-      // the array header size is uniform across element kinds (mark + klass
-      // + length, padded), so fall back to the Object-kind base offset (16
-      // by default, or the module-overridden Object value). This keeps the
-      // resolveAccess header guard `*Offset < ArrayBaseOffset` rejecting
-      // raw header GEPs (offset < ArrayBaseOffset) instead of degrading to
-      // `< 0` (which would let a raw mark/klass GEP virtualize as a Java
-      // field) while still accepting element GEPs (offset >=
-      // ArrayBaseOffset, see test 397). ArrayElementType / ArrayIndexScale
-      // stay null / 0 so the typed-GEP fast path stays inert (correct for
-      // unknown-kind arrays).
-      VO->ArrayBaseOffset = static_cast<uint32_t>(
-          VMConsts.arrayBaseOffsetFor(jeandle::JBasicType::Object));
     }
   }
 

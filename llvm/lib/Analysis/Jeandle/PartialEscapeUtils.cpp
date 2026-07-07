@@ -525,7 +525,7 @@ std::optional<uint32_t> extractInstanceSize(const CallBase *NewInstance) {
 }
 
 std::optional<uint32_t> extractArrayLength(const CallBase *NewArray) {
-  if (!isJeandleNewArray(NewArray) || NewArray->arg_size() < 2)
+  if (!isJeandleNewArray(NewArray) || NewArray->arg_size() != 5)
     return std::nullopt;
   auto *CI = dyn_cast<ConstantInt>(NewArray->getArgOperand(1));
   if (!CI)

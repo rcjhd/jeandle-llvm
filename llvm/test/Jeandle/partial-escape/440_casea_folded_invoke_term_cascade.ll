@@ -10,7 +10,7 @@
 ; pea.mat2 -> mat.cont1 -> br merge. Without the eager update, both members'
 ; InsertBefore null and applyMaterialize's assert fires.
 
-declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32)
+declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc i32 @jeandle.arraylength(ptr addrspace(1) readonly)
 declare void @sink(ptr addrspace(1))
@@ -18,7 +18,7 @@ declare i32 @__gxx_personality_v0(...)
 
 define void @casea_folded_invoke_term_cascade(i1 %c) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
-  %o1 = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 12345 to ptr), i32 7) to label %n1 unwind label %u1
+  %o1 = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 12345 to ptr), i32 7, i32 44, i32 16, i32 1048576) to label %n1 unwind label %u1
 n1:
   %o2 = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 22222 to ptr), i32 16) to label %n2 unwind label %u2
 n2:
@@ -54,7 +54,7 @@ u2:
 ; The two materializations chain at the `br` (re-aimed off the erased
 ; arraylength-invoke terminator): else -> pea.mat -> mat.cont -> pea.mat2.
 ; CHECK: else:
-; CHECK-NEXT: %{{.*}} = invoke hotspotcc{{.*}}@jeandle.new_array(ptr inttoptr (i64 12345 to ptr), i32 7)
+; CHECK-NEXT: %{{.*}} = invoke hotspotcc{{.*}}@jeandle.new_array(ptr inttoptr (i64 12345 to ptr), i32 7, i32 44, i32 16, i32 1048576)
 ; CHECK-NEXT: to label %mat.cont unwind label %u1
 ; CHECK: mat.cont:
 ; CHECK-NEXT: %{{.*}} = invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 22222 to ptr), i32 16)
