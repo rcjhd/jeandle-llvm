@@ -1,23 +1,9 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA is intentionally deopt-agnostic until the Jeandle deopt refactor
-; lands. This pins two invariants on the materialization transform:
-;
-;   (Change A) The materialization invoke must not carry a "deopt"
-;   operand bundle. Without this, the bundle on the source CallBase
-;   (here the escape-point sink) would carry the OrigAlloc reference
-;   onto NewInv, and the global RAUW would then produce a self-reference
-;   ("Only PHI nodes may reference their own value!"). Observed in the
-;   wild on java.util.HashMap.newNode, java.io.DataInputStream.readUTF,
-;   and java.lang.StringLatin1.replace.
-;
-;   (Change B) Any pre-existing "deopt" operand bundle on another
-;   CallBase that references OrigAlloc must have that operand scrubbed
-;   to a typed null BEFORE the global RAUW runs. Otherwise the RAUW
-;   would inject NewInv into deopt bundles on sibling sinks in
-;   non-dominating blocks, and a later sibling materialization would
-;   inherit those cross-block references on bundle copy ("Instruction
-;   does not dominate all uses!").
+; When a canonical Jeandle deopt bundle appears on an escape sink, PEA
+; materializes the object for the normal operand and rewrites deopt object
+; slots through lazy-object records so the materialization invoke does not
+; carry an OrigAlloc self-reference.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -29,12 +15,9 @@ entry:
             ptr inttoptr (i64 12345 to ptr), i32 16)
        to label %n unwind label %u
 n:
-  ; Sink call escape; its "deopt" bundle references the VO. Before the
-  ; fix, copying this bundle onto the new materialization invoke and
-  ; then RAUW'ing OrigAlloc -> NewInv would make NewInv reference
-  ; itself in its own deopt bundle.
+  ; Sink call escape; its deopt object slot references the VO.
   call void @sink(ptr addrspace(1) %o)
-       [ "deopt"(i32 99, ptr addrspace(1) %o) ]
+       [ "deopt"(i32 99, i32 99, i64 12, ptr addrspace(1) %o) ]
   ret void
 u:
   %lp = landingpad i64 cleanup
@@ -43,14 +26,13 @@ u:
 
 ; CHECK-LABEL: define void @deopt_bundle_scrubbed
 ;
-; Change A: the materialisation invoke carries no "deopt" bundle.
+; The materialisation invoke must not carry an OrigAlloc self-reference.
 ; CHECK: %pea.mat = invoke {{.*}}@jeandle.new_instance(ptr {{.*}}, i32 16)
+; CHECK-SAME: [ "deopt"(i32 99, i32 99,
+; CHECK-NOT: ptr addrspace(1) %o
 ; CHECK-NEXT: to label %{{.*}} unwind label %{{.*}}
 ;
-; Change B: the surviving sink call still has its "deopt" bundle, but
-; the operand that was the OrigAlloc value is now a typed null (the VO
-; slot is no longer a live SSA reference to the deleted OrigAlloc).
+; The surviving sink uses the materialized object on the normal path.
 ; CHECK: call void @sink(ptr addrspace(1) %pea.mat)
-; CHECK-SAME: [ "deopt"(i32 99, ptr addrspace(1) null) ]
 
 !java-method-compilation = !{}

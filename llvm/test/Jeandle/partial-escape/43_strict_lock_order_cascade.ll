@@ -40,7 +40,7 @@ nb:
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
                   ptr addrspace(1) %b, ptr %lock_b)
   ; Escape: the INNER object B leaks through a sink while both locks held.
-  call void @sink(ptr addrspace(1) %b)
+  call void @sink(ptr addrspace(1) %b) [ "deopt"(i32 0, i32 0) ]
   ; Release inner B.
   call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(
                   ptr addrspace(1) %b, ptr %lock_b)

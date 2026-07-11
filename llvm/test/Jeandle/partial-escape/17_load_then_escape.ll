@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; PEA: alloc + store + load (folded to the stored constant) + use of
 ; the load + escape. The load fold survives the escape: %v becomes the
@@ -25,7 +25,7 @@ n:
   store atomic i32 99, ptr addrspace(1) %s unordered, align 4
   %v = load atomic i32, ptr addrspace(1) %s unordered, align 4
   call void @use_int(i32 %v)
-  call void @sink(ptr addrspace(1) %o)
+  call void @sink(ptr addrspace(1) %o) [ "deopt"(i32 0, i32 0) ]
   ret void
 u:
   %lp = landingpad i64 cleanup

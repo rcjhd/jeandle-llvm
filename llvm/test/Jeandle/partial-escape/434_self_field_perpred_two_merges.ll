@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; Self-referential field (o.f = o) per-pred materialized at TWO merges from the
 ; same predecessor (multi-materialization). `else` is the shared PH: it branches
@@ -12,23 +12,30 @@ declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
+declare hotspotcc void @jeandle.safepoint_poll()
+
 define void @self_field_perpred_two_merges(i1 %c, i1 %c2)
     gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
   %o = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16) to label %n unwind label %u
 n:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br i1 %c, label %then, label %else
 then:
-  call void @sink(ptr addrspace(1) %o)
+  call void @sink(ptr addrspace(1) %o) [ "deopt"(i32 0, i32 0) ]
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %merge
 else:
   %slot = getelementptr inbounds i8, ptr addrspace(1) %o, i64 8
   store atomic ptr addrspace(1) %o, ptr addrspace(1) %slot unordered, align 8
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br i1 %c2, label %merge, label %S
 merge:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %S
 S:
-  call void @sink(ptr addrspace(1) %o)
+  call void @sink(ptr addrspace(1) %o) [ "deopt"(i32 0, i32 0) ]
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   ret void
 u:
   %lp = landingpad i64 cleanup

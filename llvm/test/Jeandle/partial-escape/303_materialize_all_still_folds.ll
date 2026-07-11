@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-pea-force-materialize-all=true %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-pea-force-materialize-all=true %s | FileCheck %s
 
 ; MATERIALIZE_ALL preserves intra-block folds. The
 ; -jeandle-pea-force-materialize-all=true testing knob forces every
@@ -16,13 +16,17 @@ declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink_i32(i32)
 declare i32 @__gxx_personality_v0(...)
 
+declare hotspotcc void @jeandle.safepoint_poll()
+
 define void @test_mat_all_folds(i32 %n) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %hdr
 
 hdr:
   %i = phi i32 [0, %entry], [%inext, %latch]
   %c = icmp slt i32 %i, %n
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br i1 %c, label %body, label %exit
 
 body:
@@ -34,12 +38,15 @@ b:
   store atomic i32 7, ptr addrspace(1) %slot unordered, align 4
   %v = load atomic i32, ptr addrspace(1) %slot unordered, align 4
   call void @sink_i32(i32 %v)
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %latch
 latch:
   %inext = add i32 %i, 1
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %hdr
 
 exit:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   ret void
 u:
   %lp = landingpad i64 cleanup

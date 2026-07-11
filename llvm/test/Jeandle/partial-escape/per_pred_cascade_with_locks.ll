@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; Per-pred materialization of a CYCLIC field graph. `o` is virtual on both merge
 ; preds with lock counts 0 (left) / 1 (right) — a lock mismatch — and `o` and
@@ -17,6 +17,8 @@ declare hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), pt
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
+declare hotspotcc void @jeandle.safepoint_poll()
+
 define void @per_pred_cascade_with_locks(i1 %c)
     gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
@@ -29,15 +31,19 @@ fld:
   store atomic ptr addrspace(1) %p, ptr addrspace(1) %of unordered, align 8
   %pg = getelementptr inbounds i8, ptr addrspace(1) %p, i64 8
   store atomic ptr addrspace(1) %o, ptr addrspace(1) %pg unordered, align 8
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br i1 %c, label %left, label %right
 left:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %merge
 right:
   call hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %o, ptr %lock)
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %merge
 merge:
-  call void @sink(ptr addrspace(1) %o)
-  call void @sink(ptr addrspace(1) %p)
+  call void @sink(ptr addrspace(1) %o) [ "deopt"(i32 0, i32 0) ]
+  call void @sink(ptr addrspace(1) %p) [ "deopt"(i32 0, i32 0) ]
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   ret void
 u:
   %lp = landingpad i64 cleanup

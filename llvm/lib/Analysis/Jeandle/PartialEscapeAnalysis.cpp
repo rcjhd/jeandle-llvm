@@ -56,6 +56,7 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Jeandle/JavaType.h"
+#include "llvm/IR/Jeandle/Deoptimization.h"
 #include "llvm/IR/Jeandle/Metadata.h"
 #include "llvm/IR/Jeandle/VMCallback.h"
 #include "llvm/IR/Metadata.h"
@@ -63,6 +64,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 
+#include <functional>
 #include <unordered_map>
 
 #define DEBUG_TYPE "partial-escape-analysis"
@@ -111,6 +113,15 @@ static llvm::cl::opt<bool> JeandleDumpPEAStats(
     "jeandle-dump-pea-stats", llvm::cl::init(false), llvm::cl::Hidden,
     llvm::cl::desc("PEA: dump per-function NeverEscapes / PartiallyEscapes "
                    "/ AlwaysEscapes counts on errs() after analysis."));
+
+// Allocation sinking requires a deopt state for the replacement allocation.
+// By default only the escaping call or invoke itself may provide that state.
+// The option additionally permits the nearest safe prior deopt point.
+static llvm::cl::opt<bool> JeandlePEAEnableAggressiveAllocationSinking(
+    "jeandle-pea-enable-allocation-sinking", llvm::cl::init(false),
+    llvm::cl::Hidden,
+    llvm::cl::desc("PEA: also allow allocation sinking at the nearest safe "
+                   "prior call or invoke carrying deopt state."));
 
 // Cascade other still-locked virtuals at materialization when the target uses
 // HotSpot's lightweight locking (LM_LIGHTWEIGHT requires strict lock nesting).
@@ -654,7 +665,7 @@ private:
   // tuple, creating one (and registering it in OwnedLoopFieldPhis) on first
   // use. Falls back to createUnparentedPhi (i.e. the legacy OwnedPhis path)
   // when BB is not inside any loop (LI.getLoopFor(BB) == nullptr). Inside a
-  // loop — including non-header in-loop merge blocks — the PHI must be cached
+  // loop - including non-header in-loop merge blocks - the PHI must be cached
   // so its Value* survives restoreLoopSnapshot (which preserves BlockExits[BB]
   // for loop blocks but truncates OwnedPhis).
   PHINode *getOrCreateLoopFieldPhi(BasicBlock *BB, jeandle::ObjectID ID,
@@ -802,8 +813,8 @@ private:
   // At every exit block of L, force-materialise still-virtual VOs
   // when the exit successor is an EH-pad block (landingpad / catchpad /
   // cleanuppad), to keep exception handlers from observing a
-  // partially-materialised state. TODO: downstream "deopt-bundle within
-  // reach" detection is deferred (Jeandle currently has no deopt machinery).
+  // partially-materialised state. Deopt bundles are modeled separately at
+  // their exact call sites; this loop-exit drain is only for EH visibility.
   // Called from processLoop after convergence.
   void processLoopExit(Loop *L);
   // SkipGlobalRAUW=true marks the emitted Materialize as IsPerPred, attaching a
@@ -920,6 +931,7 @@ private:
   // (Arrays.fill → llvm.memset). Until then these shapes fall through to
   // conservative materialization.
   bool processJavaOp(CallBase *CB);
+  void recordDeoptBundleState(CallBase *CB);
   // Known non-escaping LLVM intrinsics (assume, lifetime/invariant
   // markers, debug, annotations, branch hints, ...) are no-ops for PEA;
   // launder/strip.invariant.group forward the argument's virtual alias.
@@ -974,6 +986,15 @@ private:
   // processLoad bail (markIneligible rather than materialize, to keep a
   // pre-computed derived address valid).
   void markVirtualOperandsIneligible(Instruction *I);
+  struct DeoptMaterializeAnchor {
+    Instruction *InsertBefore = nullptr;
+    CallBase *DeoptSource = nullptr;
+  };
+  bool instructionUsesAnyVirtualObject(Instruction *I);
+  bool canHoistMaterializeToDeoptAnchor(Instruction *Anchor,
+                                        Instruction *EscapePoint);
+  std::optional<DeoptMaterializeAnchor>
+  findDeoptMaterializeAnchor(Instruction *EscapePoint);
   void materializeAt(jeandle::ObjectID ID, Instruction *InsertBefore,
                      MatReason Reason = MatReason::Unhandled);
 
@@ -1058,6 +1079,7 @@ private:
   // the four reasons (Unhandled / Merge / LoopExit / PHI).
   static void bumpMaterializeStat(MatReason R);
 
+  void validateAllocationEliminationPlans();
   void commit();
   void dropEffectsFor(jeandle::ObjectID ID);
 
@@ -1370,8 +1392,8 @@ PHINode *Analyzer::getOrCreateLoopFieldPhi(BasicBlock *BB, jeandle::ObjectID ID,
                                            int64_t Offset, Type *Ty, unsigned N,
                                            const Twine &Name) {
   // Outside any loop (LI.getLoopFor(BB) == nullptr), fall back to the legacy
-  // single-shot OwnedPhis path. Inside a loop — including NON-HEADER in-loop
-  // merge blocks — the PHI is cached so its Value* stays stable across
+  // single-shot OwnedPhis path. Inside a loop - including NON-HEADER in-loop
+  // merge blocks - the PHI is cached so its Value* stays stable across
   // fixpoint iterations: restoreLoopSnapshot preserves BlockExits[BB] for
   // every loop block (so the next iteration's in-pass mergeStates(Header)
   // can read the back-edge pred's exit state), and any Value* reachable from
@@ -1379,7 +1401,7 @@ PHINode *Analyzer::getOrCreateLoopFieldPhi(BasicBlock *BB, jeandle::ObjectID ID,
   // live in OwnedLoopFieldPhis, which restoreLoopSnapshot does NOT pop
   // (unlike OwnedPhis); were a non-header in-loop merge to bypass the cache,
   // its PHI would land in OwnedPhis and be deleted on rollback while the
-  // preserved BlockExits[BB] still references it → dangling Value*.
+  // preserved BlockExits[BB] still references it -> dangling Value*.
   if (!LI.getLoopFor(BB))
     return createUnparentedPhi(Ty, N, Name);
 
@@ -2903,7 +2925,7 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
     // Route through the LoopFieldPhiCache so the per-(BB, NewID, Off) PHI
     // shell is REUSED across loop-fixpoint iterations. Same Value* across
     // iters keeps FieldStates structurally equivalent for the convergence
-    // check, and — for non-header in-loop merge BBs — keeps the PHI alive
+    // check, and - for non-header in-loop merge BBs - keeps the PHI alive
     // (OwnedLoopFieldPhis) so the preserved BlockExits[BB] does not reference
     // a PHI that rollback deletes. For BBs outside any loop the cache is
     // bypassed (getOrCreateLoopFieldPhi falls back to createUnparentedPhi).
@@ -2987,8 +3009,10 @@ void Analyzer::processInstruction(Instruction *I) {
   if (isa<PHINode>(I))
     return;
 
-  // Allocation: Jeandle allocation site.
+  // Deoptimization state is carried in operand bundles, so record it before
+  // any early-returning CallBase handler (notably allocation virtualization).
   if (auto *CB = dyn_cast<CallBase>(I)) {
+    recordDeoptBundleState(CB);
     if (jeandle::pea::isJeandleAllocation(CB)) {
       processAllocation(CB);
       return;
@@ -3025,13 +3049,13 @@ void Analyzer::processInstruction(Instruction *I) {
   //
   // Placement: Graal reaches this from processNodeInternal's hasVirtualInputs-
   // gated virtualizable stage because a Graal MonitorEnterNode carries a
-  // stateAfter FrameState that references the virtual object. LLVM
-  // monitorenters carry no such frame state (deopt is deferred), so a
-  // non-virtual receiver has NO virtual input and never enters the gate below —
-  // the cascade is therefore checked here, outside the gate. A virtual-receiver
-  // monitorenter is handled by foldMonitorEnter inside the gate (elision + its
-  // own elide-path pre-cascade), so this fires only when the receiver does NOT
-  // resolve to a virtual.
+  // stateAfter FrameState that references the virtual object. Jeandle models
+  // deopt state through operand bundles instead of normal FrameState inputs on
+  // monitorenter, so a non-virtual receiver has NO virtual input and never
+  // enters the gate below — the cascade is therefore checked here, outside the
+  // gate. A virtual-receiver monitorenter is handled by foldMonitorEnter inside
+  // the gate (elision + its own elide-path pre-cascade), so this fires only
+  // when the receiver does NOT resolve to a virtual.
   if (StrictLockOrder) {
     if (auto *CB = dyn_cast<CallBase>(I)) {
       if (jeandle::pea::isJeandleMonitorEnter(CB) && CB->arg_size() >= 1) {
@@ -4352,6 +4376,217 @@ bool Analyzer::processJavaOp(CallBase *CB) {
   return false;
 }
 
+static SmallVector<Value *, 32>
+collectDeoptInputs(const OperandBundleUse &Deopt) {
+  SmallVector<Value *, 32> Inputs;
+  Inputs.reserve(Deopt.Inputs.size());
+  for (const Use &U : Deopt.Inputs)
+    Inputs.push_back(U.get());
+  return Inputs;
+}
+
+static bool visitDeoptRecords(
+    ArrayRef<Value *> Inputs,
+    function_ref<bool(unsigned, const jeandle::DeoptValueEncoding &)> Visit) {
+  bool AtScopeStart = true;
+  for (unsigned I = 0, E = Inputs.size(); I < E;) {
+    if (AtScopeStart) {
+      assert(jeandle::startsWithDeoptScopeHeader(Inputs, I) &&
+             "deopt bundle must start with a scope header");
+      I = jeandle::skipDeoptScopeHeader(Inputs, I);
+      AtScopeStart = false;
+      continue;
+    }
+
+    auto *Encoding = cast<ConstantInt>(Inputs[I]);
+    assert(Encoding->getType()->isIntegerTy(64) &&
+           "expected i64 deopt value encoding");
+    jeandle::DeoptValueEncoding Enc =
+        jeandle::DeoptValueEncoding::decode(Encoding->getZExtValue());
+    auto VT = Enc.valueType();
+    unsigned Next = 0;
+
+    if (VT == jeandle::DeoptValueEncoding::LocalType ||
+        VT == jeandle::DeoptValueEncoding::StackType ||
+        VT == jeandle::DeoptValueEncoding::NarrowOopMarkerType ||
+        VT == jeandle::DeoptValueEncoding::OrigPcSlotType ||
+        VT == jeandle::DeoptValueEncoding::MethodType) {
+      Next = jeandle::deoptRecordEnd(I, E, 2);
+    } else if (VT == jeandle::DeoptValueEncoding::MonitorType) {
+      Next = jeandle::deoptRecordEnd(I, E, 3);
+    } else if (VT == jeandle::DeoptValueEncoding::LazyObjectType) {
+      assert(I + 2 < E && "truncated lazy-object deopt record");
+      auto *CountC = dyn_cast<ConstantInt>(Inputs[I + 2]);
+      assert(CountC && "lazy-object field count must be constant");
+      unsigned Count = static_cast<unsigned>(CountC->getZExtValue());
+      Next = jeandle::deoptRecordEnd(I, E, 3 + Count * 3);
+    } else {
+      llvm_unreachable("unknown deopt value type");
+    }
+
+    if (Visit(I, Enc))
+      return true;
+
+    I = Next;
+    if (VT == jeandle::DeoptValueEncoding::MethodType)
+      AtScopeStart = true;
+  }
+  return false;
+}
+
+static std::optional<unsigned>
+deoptObjectOperandIndex(unsigned Begin, const jeandle::DeoptValueEncoding &Enc) {
+  if (!jeandle::isObjectDeoptEncoding(Enc))
+    return std::nullopt;
+
+  auto VT = Enc.valueType();
+  if (VT == jeandle::DeoptValueEncoding::LocalType ||
+      VT == jeandle::DeoptValueEncoding::StackType ||
+      VT == jeandle::DeoptValueEncoding::MonitorType)
+    return Begin + 1;
+
+  return std::nullopt;
+}
+
+void Analyzer::recordDeoptBundleState(CallBase *CB) {
+  std::optional<OperandBundleUse> Deopt = CB->getOperandBundle("deopt");
+  if (!Deopt)
+    return;
+
+  SmallVector<Value *, 32> Inputs = collectDeoptInputs(*Deopt);
+
+  SmallVector<jeandle::RecordDeoptStateEffect::ObjectSnapshot, 4> Objects;
+  DenseMap<jeandle::ObjectID, unsigned> ObjectIndex;
+  DenseMap<jeandle::ObjectID, SmallVector<Value *, 2>> ObjectValues;
+
+  enum class CaptureState : uint8_t { Capturing, Captured, Failed };
+  DenseMap<jeandle::ObjectID, CaptureState> CaptureStates;
+
+  auto AddValue = [&](jeandle::ObjectID ID, Value *ObjVal) {
+    if (!ObjVal)
+      return;
+    auto Existing = ObjectIndex.find(ID);
+    if (Existing != ObjectIndex.end()) {
+      auto &Values = Objects[Existing->second].Values;
+      if (!llvm::is_contained(Values, ObjVal))
+        Values.push_back(ObjVal);
+      return;
+    }
+
+    auto &Values = ObjectValues[ID];
+    if (!llvm::is_contained(Values, ObjVal))
+      Values.push_back(ObjVal);
+  };
+
+  auto DominatesDeoptPoint = [&](Value *V) {
+    if (auto *FieldI = dyn_cast_or_null<Instruction>(V))
+      if (FieldI->getParent() && !DT.dominates(FieldI, CB))
+        return false;
+    return true;
+  };
+
+  std::function<bool(jeandle::ObjectID)> CaptureID =
+      [&](jeandle::ObjectID ID) -> bool {
+    auto StateIt = CaptureStates.find(ID);
+    if (StateIt != CaptureStates.end())
+      return StateIt->second != CaptureState::Failed;
+
+    if (ID == jeandle::InvalidObjectID || ID >= Result.VirtualObjects.size() ||
+        !Result.VirtualObjects[ID] || !Eligible.lookup(ID)) {
+      CaptureStates[ID] = CaptureState::Failed;
+      return false;
+    }
+
+    jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
+    if (!VObj.isInstance() || VObj.Klass == 0) {
+      CaptureStates[ID] = CaptureState::Failed;
+      return false;
+    }
+
+    CaptureStates[ID] = CaptureState::Capturing;
+
+    jeandle::RecordDeoptStateEffect::ObjectSnapshot Snapshot;
+    Snapshot.ID = ID;
+    auto ValuesIt = ObjectValues.find(ID);
+    if (ValuesIt != ObjectValues.end())
+      for (Value *V : ValuesIt->second)
+        Snapshot.Values.emplace_back(V);
+
+    auto FSIt = FieldStates.find(ID);
+    if (FSIt != FieldStates.end()) {
+      SmallVector<int64_t, 8> Offsets;
+      Offsets.reserve(FSIt->second.size());
+      for (const auto &Kv : FSIt->second)
+        Offsets.push_back(Kv.first);
+      llvm::sort(Offsets);
+
+      for (int64_t Off : Offsets) {
+        const jeandle::FieldValue &FV = FSIt->second.lookup(Off);
+        if (FV.isUnknown())
+          continue;
+
+        if (FV.isScalar()) {
+          if (!DominatesDeoptPoint(FV.getScalar())) {
+            CaptureStates[ID] = CaptureState::Failed;
+            return false;
+          }
+        } else if (FV.isMaterializedRef()) {
+          if (!DominatesDeoptPoint(FV.getMaterialized())) {
+            CaptureStates[ID] = CaptureState::Failed;
+            return false;
+          }
+        } else if (FV.isVirtualRef()) {
+          if (!CaptureID(FV.getVirtualRef())) {
+            CaptureStates[ID] = CaptureState::Failed;
+            return false;
+          }
+        }
+
+        Snapshot.FieldEntries.push_back({Off, FV});
+      }
+    }
+
+    ObjectIndex[ID] = Objects.size();
+    Objects.push_back(std::move(Snapshot));
+    CaptureStates[ID] = CaptureState::Captured;
+    return true;
+  };
+
+  auto Capture = [&](Value *ObjVal) {
+    if (!ObjVal || !ObjVal->getType()->isPointerTy())
+      return;
+    std::optional<jeandle::ObjectID> MaybeID =
+        jeandle::pea::resolveVirtualRef(ObjVal, CurrentState, Aliases, DL);
+    if (!MaybeID)
+      return;
+
+    jeandle::ObjectID ID = *MaybeID;
+    if (!Eligible.lookup(ID))
+      return;
+
+    AddValue(ID, ObjVal);
+    if (!CaptureID(ID))
+      materializeAt(ID, CB, MatReason::Unhandled);
+  };
+
+  visitDeoptRecords(Inputs, [&](unsigned Begin,
+                                const jeandle::DeoptValueEncoding &Enc) {
+    if (std::optional<unsigned> ObjIdx = deoptObjectOperandIndex(Begin, Enc))
+      Capture(Inputs[*ObjIdx]);
+    return false;
+  });
+
+  for (auto &Snapshot : Objects) {
+    auto E = std::make_unique<jeandle::RecordDeoptStateEffect>();
+    E->Block = CB->getParent();
+    E->Target = CB;
+    E->SeqNo = Result.nextSeqNo();
+    E->ObjID = Snapshot.ID;
+    E->Snapshot = std::move(Snapshot);
+    Result.addBlockEffect(std::move(E));
+  }
+}
+
 void Analyzer::propagatePointerAlias(Instruction *I) {
   // The instruction is a pointer-identity-preserving transformation whose
   // operand carries a virtual alias. Forward the alias to the result.
@@ -4392,6 +4627,32 @@ void Analyzer::propagatePointerAlias(Instruction *I) {
   Aliases.addVirtualAlias(I, *BaseID);
 }
 
+static bool isDeoptBundleOperand(Instruction *I, const Use &U) {
+  auto *CB = dyn_cast<CallBase>(I);
+  if (!CB || !CB->hasOperandBundles() || !CB->isBundleOperand(&U))
+    return false;
+  unsigned OpIdx = static_cast<unsigned>(&U - CB->op_begin());
+  return CB->getOperandBundleForOperand(OpIdx).getTagName() == "deopt";
+}
+
+static bool isModeledDeoptObjectOperand(Instruction *I, const Use &U) {
+  auto *CB = dyn_cast<CallBase>(I);
+  if (!CB || !isDeoptBundleOperand(I, U))
+    return false;
+  std::optional<OperandBundleUse> Deopt = CB->getOperandBundle("deopt");
+  if (!Deopt)
+    return false;
+
+  SmallVector<Value *, 32> Inputs = collectDeoptInputs(*Deopt);
+  return visitDeoptRecords(
+      Inputs, [&](unsigned Begin, const jeandle::DeoptValueEncoding &Enc) {
+        if (std::optional<unsigned> ObjIdx =
+                deoptObjectOperandIndex(Begin, Enc))
+          return &Deopt->Inputs[*ObjIdx] == &U;
+        return false;
+      });
+}
+
 void Analyzer::materializeAllVirtualOperands(Instruction *I) {
   // Trigger materialization for every distinct virtual ObjectID that I uses.
   // After materializeAt, the per-object state in CurrentState flips to
@@ -4404,6 +4665,8 @@ void Analyzer::materializeAllVirtualOperands(Instruction *I) {
   SmallVector<jeandle::ObjectID, 4> ToMaterialize;
   DenseSet<jeandle::ObjectID> Seen;
   for (Use &U : I->operands()) {
+    if (isModeledDeoptObjectOperand(I, U))
+      continue;
     Value *V = U.get();
     if (!V)
       continue;
@@ -4485,12 +4748,11 @@ void Analyzer::markVirtualOperandsIneligible(Instruction *I) {
     markIneligible(ID);
 }
 
-// Materialize placement is escape-point / predecessor-end (Graal
-// materializeBefore=node): materializeAt places at the escape-point
-// instruction; materializeAtPredFromExitInfo places at the predecessor's
-// terminator (Graal predecessor.getEndNode()). OrigAlloc uses are resolved
-// per-point by the transform's resolution sub-pass, so a non-dominating
-// materialize is SSA-sound.
+// Live-path materialization uses the escaping call or invoke by default. The
+// allocation-sinking option additionally permits the nearest safe prior deopt
+// point in the same block. Per-predecessor materialization stays at the
+// predecessor terminator. commit() rejects every effect whose actual insertion
+// point cannot provide deopt state.
 
 // Returns true iff CB has at least one "deopt" operand bundle.
 static bool hasDeoptBundle(CallBase *CB) {
@@ -4498,6 +4760,64 @@ static bool hasDeoptBundle(CallBase *CB) {
     if (CB->getOperandBundleAt(i).getTagName() == "deopt")
       return true;
   return false;
+}
+
+static CallBase *getCallOrInvokeWithDeoptState(Instruction *I) {
+  auto *CB = dyn_cast_or_null<CallBase>(I);
+  if (!CB || (!isa<CallInst>(CB) && !isa<InvokeInst>(CB)) ||
+      !hasDeoptBundle(CB))
+    return nullptr;
+  return CB;
+}
+
+bool Analyzer::instructionUsesAnyVirtualObject(Instruction *I) {
+  for (Use &U : I->operands()) {
+    Value *V = U.get();
+    if (V && jeandle::pea::resolveVirtualRef(V, CurrentState, Aliases, DL))
+      return true;
+  }
+  return false;
+}
+
+bool Analyzer::canHoistMaterializeToDeoptAnchor(Instruction *Anchor,
+                                                Instruction *EscapePoint) {
+  if (!Anchor || !EscapePoint || Anchor->getParent() != EscapePoint->getParent())
+    return false;
+
+  // We reuse the current (escape-point) FieldStates snapshot. Any intervening
+  // virtual-object activity could make that snapshot newer than the anchor.
+  for (Instruction *I = Anchor->getNextNode(); I && I != EscapePoint;
+       I = I->getNextNode()) {
+    if (instructionUsesAnyVirtualObject(I))
+      return false;
+  }
+  return true;
+}
+
+std::optional<Analyzer::DeoptMaterializeAnchor>
+Analyzer::findDeoptMaterializeAnchor(Instruction *EscapePoint) {
+  if (!EscapePoint)
+    return std::nullopt;
+
+  if (CallBase *CB = getCallOrInvokeWithDeoptState(EscapePoint))
+    return DeoptMaterializeAnchor{EscapePoint, CB};
+
+  if (!JeandlePEAEnableAggressiveAllocationSinking)
+    return std::nullopt;
+
+  // Same-block only: crossing CFG edges would require a path-sensitive virtual
+  // state snapshot at the anchor and replay/validation of all intervening
+  // virtual updates.
+  for (Instruction *I = EscapePoint->getPrevNode(); I; I = I->getPrevNode()) {
+    CallBase *CB = getCallOrInvokeWithDeoptState(I);
+    if (!CB)
+      continue;
+    if (!canHoistMaterializeToDeoptAnchor(I, EscapePoint))
+      return std::nullopt;
+    return DeoptMaterializeAnchor{I, CB};
+  }
+
+  return std::nullopt;
 }
 
 // Sweep sibling VOs' FieldStates after a materialisation. Runs for EVERY
@@ -4814,14 +5134,22 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
 
 void Analyzer::materializeAt(jeandle::ObjectID ID, Instruction *InsertBefore,
                              MatReason Reason) {
-  // Escape-point (live-state) path. Delegates the shared cascade / lock-capture
-  // / recursive-prereq / dominance / emit / flip algorithm to
+  // Live-state path. Delegates the shared cascade / lock-capture /
+  // recursive-prereq / dominance / emit / flip algorithm to
   // ensureMaterialized (Graal ensureMaterialized -> materializeBefore ->
   // materializeWithCommit). This wrapper supplies the live analyzer maps, the
   // function-wide Materialized idempotency set, recursion back into
-  // materializeAt, and the live-path- specific behaviour: SafeIP is the
-  // escape-point instruction, no IsPerPred flag, deopt bundle sourced from the
-  // escape-point call, and the flip applied to the live CurrentState.
+  // materializeAt, and the live-path-specific anchor selection.
+  if (Materialized.count(ID) || !Eligible.lookup(ID) || CurrentState.isDead())
+    return;
+
+  std::optional<DeoptMaterializeAnchor> Anchor =
+      findDeoptMaterializeAnchor(InsertBefore);
+  if (!Anchor) {
+    markIneligible(ID);
+    return;
+  }
+
   auto ClearLockState = [&](jeandle::ObjectID Oid) {
     LockCounts[Oid] = 0;
     LiveLockEnters.erase(Oid);
@@ -4841,53 +5169,12 @@ void Analyzer::materializeAt(jeandle::ObjectID ID, Instruction *InsertBefore,
       Aliases.resetAlias(V);
   };
   auto ComputeSafeIP = [&]() -> Instruction * {
-    // Escape-point placement (Graal materializeBefore=node,
-    // PartialEscapeClosure.ensureMaterialized -> materializeBefore): always
-    // materialize at the instruction that triggered the escape. Graal never
-    // hoists a live-path materialize to the allocation's normal-dest, and
-    // neither do we.
-    //
-    // Loop-body escape — the escape point sits in a loop that does not contain
-    // the allocation — does NOT require hoisting for soundness. The loop
-    // fixpoint (processLoop) clears every loop-block effect on each retry
-    // (restoreLoopSnapshot), and the post-body mergeStates(Header) builds the
-    // Graal materializedValuePhi + a single materialize at the preheader end
-    // (materializeAndBuildPhi -> materializeAtPredFromExitInfo, SafeIP =
-    // PH->getTerminator() = Graal predecessor.getEndNode()). Concretely:
-    //   * Escape FLOWS TO THE LATCH (escape block is a loop block): the Iter-0
-    //     escape-point Materialize is cleared on Iter 1; the header merge flips
-    //     the object to materialized{phi} so the body escape becomes a no-op
-    //     (resolveVirtualRef returns nullopt for a materialized object); on
-    //     convergence phi(M_pre, phi) is trivial (folds to M_pre via
-    //     CreatePHIEffect resolving the OrigAlloc incoming to NewInv_pre). This
-    //     is exactly Graal's materializedValuePhi at the loop header.
-    //   * Escape EXITS THE LOOP (escape block is not in the loop): the latch
-    //     sees the object virtual, the header merge keeps it virtual
-    //     (mergeFieldStates), and the escape-point Materialize persists only on
-    //     the escape-exiting path — executed at most once because that path
-    //     leaves the loop. The object stays scalar-replaced on the normal path:
-    //     true partial escape.
-    // Nested loops are handled by the recursive processLoop: the outer fixpoint
-    // clears the inner-preheader Materialize and the outer materializedValuePhi
-    // propagates materialization into the inner loop, yielding a single
-    // materialize at the outermost preheader. Mode::StopNewInLoopNest +
-    // MATERIALIZE_ALL escalation remain the safety net for pathological nests.
-    //
-    // OrigAlloc uses that the escape-point NewInv does not dominate — notably
-    // uses at a multi-pred merge where the object is still virtual on another
-    // arm — are resolved per-point by the transform: materializeAndBuildPhi
-    // builds a materializedValuePhi over the per-arm materialized pointers, and
-    // the resolution sub-pass (resolveMaterializedUses) rewrites the use to the
-    // dominating def. So escape-point placement is SSA-sound for every escape.
-    return InsertBefore;
+    // The default mode reaches only the escaping instruction; the option may
+    // select the nearest safe prior deopt point.
+    return Anchor->InsertBefore;
   };
   auto SetEffectFlags = [&](jeandle::MaterializeEffect &E, Instruction *) {
-    jeandle::VirtualObject &V = *Result.VirtualObjects[ID];
-    CallBase *DBS = V.AllocationCall;
-    if (auto *CB = dyn_cast<CallBase>(InsertBefore))
-      if (hasDeoptBundle(CB))
-        DBS = CB;
-    E.DeoptBundleSource = DBS;
+    E.DeoptBundleSource = Anchor->DeoptSource;
   };
   auto FlipState = [&](jeandle::ObjectID Oid) {
     CurrentState.getObjectStateForModification(Oid).escape(
@@ -4936,7 +5223,219 @@ void Analyzer::dropEffectsFor(jeandle::ObjectID ID) {
       jeandle::PEAResult::EscapeKind::AlwaysEscapes;
 }
 
+void Analyzer::validateAllocationEliminationPlans() {
+  // Soundness guard for NeverEscapes candidates. Eliminating an
+  // allocation RAUWs the original allocation result to poison in the
+  // transform. That is only valid if every use reachable from the original
+  // allocation is also erased/replaced by this PEA plan, or if a global
+  // materialized pointer rewrite (Materialize / RAUW-to-PHI) will replace the
+  // allocation before the elimination sweep. If a live use remains, keep the
+  // original IR by marking the VO ineligible and dropping its effects below.
+  struct PlannedRemoval {
+    jeandle::ObjectID Owner;
+    Instruction *Target;
+  };
+  struct PlannedEdgeRemoval {
+    jeandle::ObjectID Owner;
+    BasicBlock *From;
+    BasicBlock *To;
+  };
+  SmallVector<PlannedRemoval, 16> PlannedRemovals;
+  SmallVector<PlannedEdgeRemoval, 8> PlannedEdgeRemovals;
+  DenseMap<jeandle::ObjectID, DenseSet<Value *>> DeoptRecordedValues;
+  DenseSet<jeandle::ObjectID> HasGlobalPointerRewrite;
+  for (const auto &Kv : Result.BlockEffects) {
+    for (const auto &E : Kv.second) {
+      switch (E.getKind()) {
+      case jeandle::Effect::Kind::ReplaceLoad:
+      case jeandle::Effect::Kind::ReplaceCall:
+      case jeandle::Effect::Kind::EliminateStore:
+      case jeandle::Effect::Kind::EliminateAllocation:
+        if (Instruction *Target = E.getTarget()) {
+          PlannedRemovals.push_back({E.ObjID, Target});
+          if ((E.getKind() == jeandle::Effect::Kind::ReplaceCall ||
+               E.getKind() == jeandle::Effect::Kind::EliminateAllocation))
+            if (auto *II = dyn_cast<InvokeInst>(Target))
+              PlannedEdgeRemovals.push_back(
+                  {E.ObjID, II->getParent(), II->getUnwindDest()});
+        }
+        break;
+      case jeandle::Effect::Kind::Materialize:
+        if (const auto *M = dyn_cast<jeandle::MaterializeEffect>(&E);
+            M && !M->IsPerPred)
+          HasGlobalPointerRewrite.insert(E.ObjID);
+        break;
+      case jeandle::Effect::Kind::RecordDeoptState:
+        if (const auto *R = dyn_cast<jeandle::RecordDeoptStateEffect>(&E))
+          for (const WeakTrackingVH &VH : R->Snapshot.Values)
+            if (Value *V = VH)
+              DeoptRecordedValues[E.ObjID].insert(V);
+        break;
+      case jeandle::Effect::Kind::CreatePHI:
+        if (const auto *C = dyn_cast<jeandle::CreatePHIEffect>(&E);
+            C && C->RAUWOrigToPHI)
+          HasGlobalPointerRewrite.insert(E.ObjID);
+        break;
+      case jeandle::Effect::Kind::RewritePhiIncoming:
+        break;
+      }
+    }
+  }
+
+  auto IsIdentityForwarder = [](Instruction *I) {
+    return isa<GetElementPtrInst>(I) || isa<BitCastInst>(I) ||
+           isa<AddrSpaceCastInst>(I) || isa<FreezeInst>(I) ||
+           isa<SelectInst>(I) || isa<PHINode>(I);
+  };
+
+  auto IsHarmlessIntrinsicUse = [](IntrinsicInst *II) {
+    switch (II->getIntrinsicID()) {
+    case Intrinsic::assume:
+    case Intrinsic::lifetime_start:
+    case Intrinsic::lifetime_end:
+    case Intrinsic::invariant_start:
+    case Intrinsic::invariant_end:
+    case Intrinsic::experimental_noalias_scope_decl:
+    case Intrinsic::dbg_declare:
+    case Intrinsic::dbg_value:
+    case Intrinsic::dbg_label:
+    case Intrinsic::donothing:
+    case Intrinsic::sideeffect:
+    case Intrinsic::is_constant:
+      return true;
+    default:
+      return false;
+    }
+  };
+
+  DenseSet<Instruction *> ActiveRemovedTargets;
+  DenseSet<BasicBlock *> ReachableBlocks;
+
+  std::function<bool(Value *, jeandle::ObjectID, SmallPtrSetImpl<Value *> &)>
+      HasLiveUseOutsidePlan =
+          [&](Value *V, jeandle::ObjectID ID,
+              SmallPtrSetImpl<Value *> &Visited) -> bool {
+    for (Use &U : V->uses()) {
+      auto *I = dyn_cast<Instruction>(U.getUser());
+      if (!I)
+        return true;
+
+      if (I->getParent() && !ReachableBlocks.count(I->getParent()))
+        continue;
+
+      if (ActiveRemovedTargets.count(I))
+        continue;
+
+      if (isDeoptBundleOperand(I, U)) {
+        auto DIt = DeoptRecordedValues.find(ID);
+        if (DIt != DeoptRecordedValues.end() && DIt->second.count(V))
+          continue;
+      }
+
+      if (auto *II = dyn_cast<IntrinsicInst>(I)) {
+        if (IsHarmlessIntrinsicUse(II))
+          continue;
+        if (II->getIntrinsicID() == Intrinsic::launder_invariant_group ||
+            II->getIntrinsicID() == Intrinsic::strip_invariant_group ||
+            II->getIntrinsicID() == Intrinsic::ptr_annotation) {
+          if (!Visited.insert(I).second)
+            continue;
+          if (HasLiveUseOutsidePlan(I, ID, Visited))
+            return true;
+          continue;
+        }
+        return true;
+      }
+
+      if (IsIdentityForwarder(I)) {
+        if (!Visited.insert(I).second)
+          continue;
+        if (HasLiveUseOutsidePlan(I, ID, Visited))
+          return true;
+        continue;
+      }
+
+      return true;
+    }
+    return false;
+  };
+
+  bool EligibilityChanged;
+  do {
+    ActiveRemovedTargets.clear();
+    DenseSet<std::pair<BasicBlock *, BasicBlock *>> ActiveRemovedEdges;
+    for (const PlannedRemoval &Plan : PlannedRemovals)
+      if (Eligible.lookup(Plan.Owner))
+        ActiveRemovedTargets.insert(Plan.Target);
+    for (const PlannedEdgeRemoval &Plan : PlannedEdgeRemovals)
+      if (Eligible.lookup(Plan.Owner))
+        ActiveRemovedEdges.insert({Plan.From, Plan.To});
+
+    ReachableBlocks.clear();
+    SmallVector<BasicBlock *, 16> Worklist;
+    Worklist.push_back(&F.getEntryBlock());
+    while (!Worklist.empty()) {
+      BasicBlock *BB = Worklist.pop_back_val();
+      if (!ReachableBlocks.insert(BB).second)
+        continue;
+      for (BasicBlock *Succ : successors(BB))
+        if (!ActiveRemovedEdges.count({BB, Succ}))
+          Worklist.push_back(Succ);
+    }
+
+    EligibilityChanged = false;
+    for (auto &VObjUP : Result.VirtualObjects) {
+      jeandle::ObjectID ID = VObjUP->getID();
+      auto EIt = Eligible.find(ID);
+      bool IsEligible = (EIt != Eligible.end()) && EIt->second;
+      if (!IsEligible || HasGlobalPointerRewrite.count(ID))
+        continue;
+      SmallPtrSet<Value *, 16> Visited;
+      Visited.insert(VObjUP->AllocationCall);
+      if (HasLiveUseOutsidePlan(VObjUP->AllocationCall, ID, Visited)) {
+        Eligible[ID] = false;
+        EligibilityChanged = true;
+      }
+    }
+  } while (EligibilityChanged);
+}
+
 void Analyzer::commit() {
+  // Every replacement allocation must be emitted exactly at a surviving call
+  // or invoke carrying the deopt state it reuses.
+  DenseSet<Instruction *> PlannedEffectRemovals;
+  for (const auto &Kv : Result.BlockEffects) {
+    for (const auto &E : Kv.second) {
+      switch (E.getKind()) {
+      case jeandle::Effect::Kind::ReplaceLoad:
+      case jeandle::Effect::Kind::ReplaceCall:
+      case jeandle::Effect::Kind::EliminateStore:
+      case jeandle::Effect::Kind::EliminateAllocation:
+        if (Instruction *Target = E.getTarget())
+          PlannedEffectRemovals.insert(Target);
+        break;
+      default:
+        break;
+      }
+    }
+  }
+
+  for (const auto &Kv : Result.BlockEffects) {
+    for (const auto &E : Kv.second) {
+      const auto *M = dyn_cast<jeandle::MaterializeEffect>(&E);
+      if (!M)
+        continue;
+      auto *Point = dyn_cast_or_null<Instruction>(
+          static_cast<Value *>(M->InsertBefore));
+      CallBase *DeoptPoint = getCallOrInvokeWithDeoptState(Point);
+      auto *DeoptSource = dyn_cast_or_null<CallBase>(
+          static_cast<Value *>(M->DeoptBundleSource));
+      if (!DeoptPoint || DeoptSource != DeoptPoint ||
+          PlannedEffectRemovals.count(Point))
+        Eligible[E.ObjID] = false;
+    }
+  }
+
   // Any virtual whose monitor lock count is non-zero at the end of analysis
   // has unbalanced enter/exit pairs (e.g., only an enter was seen, or the
   // matching exit lives in a different block we don't track yet). Mark
@@ -4946,6 +5445,8 @@ void Analyzer::commit() {
     if (Kv.second != 0)
       Eligible[Kv.first] = false;
   }
+
+  validateAllocationEliminationPlans();
 
   // Transitive ineligibility cascade over FieldStates VirtualRef entries.
   // Any virtual referenced by a kept-real (ineligible) object's field must
@@ -5301,14 +5802,14 @@ void Analyzer::materializeAtPredFromExitInfo(
     }
   };
   auto ComputeSafeIP = [&]() -> Instruction * {
-    // Per-predecessor placement (Graal predecessor.getEndNode(),
-    // PartialEscapeClosure.java merge ~996): materialize at the predecessor's
-    // terminator. The allocation (in PH or a dominator) precedes the terminator
-    // by SSA, so this is a valid IP. Synthetic VOs (borrowed AllocationCall)
-    // bail to ineligible in ensureMaterialized before reaching here.
-    return PH->getTerminator();
+    Instruction *Term = PH->getTerminator();
+    if (JeandlePEAEnableAggressiveAllocationSinking)
+      if (CallBase *CB = getCallOrInvokeWithDeoptState(Term->getPrevNode()))
+        return CB;
+    return Term;
   };
-  auto SetEffectFlags = [&](jeandle::MaterializeEffect &E, Instruction *) {
+  auto SetEffectFlags = [&](jeandle::MaterializeEffect &E,
+                              Instruction *SafeIP) {
     jeandle::VirtualObject &V = *Result.VirtualObjects[ID];
     E.IsPerPred = SkipGlobalRAUW;
     E.TargetMergeBB = TargetMerge;
@@ -5317,7 +5818,10 @@ void Analyzer::materializeAtPredFromExitInfo(
     // own NewInv via MatPerBlock.
     E.PerPredPlaceholder =
         getOrCreatePerPredMatPlaceholder(PH, TargetMerge, ID);
-    E.DeoptBundleSource = V.AllocationCall;
+    if (CallBase *CB = getCallOrInvokeWithDeoptState(SafeIP))
+      E.DeoptBundleSource = CB;
+    else
+      E.DeoptBundleSource = V.AllocationCall;
   };
   auto FlipState = [&](jeandle::ObjectID Oid) {
     // Per-pred (SkipGlobalRAUW): no flip — the NewInv dominates one critical
@@ -5386,9 +5890,9 @@ void Analyzer::materializeAtPredFromExitInfo(
 // sees the preheader BlockExitInfo plus the pass-i backedge BlockExitInfo, so
 // decisions stabilise once the per-block exits do (Jeandle's BlockExits-based
 // convergence stands in for Graal's equivalentTo on cloned state). Field PHIs
-// at the loop header MUST be stable across passes (same Value*) for the
-// convergence comparison — that is the purpose of LoopFieldPhiCache /
-// OwnedLoopFieldPhis.
+// in loop blocks MUST be stable across passes (same Value*) for the convergence
+// comparison and for preserved BlockExits that feed later header merges — that
+// is the purpose of LoopFieldPhiCache / OwnedLoopFieldPhis.
 //
 // On non-convergence OR overflow (OverflowFlag, latched in ensureMaterialized
 // under Mode::StopNewInLoopNest), escalate to Mode::MaterializeAll ONCE and
@@ -5536,7 +6040,7 @@ void Analyzer::restoreLoopSnapshot(
     Eligible[Result.VirtualObjects[I]->getID()] = true;
   }
 
-  // Defensive invariant: no PRESERVED BlockExits[BB] (BB ∈ LoopBlocks) may
+  // Defensive invariant: no PRESERVED BlockExits[BB] (BB in LoopBlocks) may
   // reference an unparented PHI we are about to delete below. BlockExits for
   // loop blocks is deliberately preserved across rollback (see the rationale
   // at the bottom of this function), so every Value* reachable from a
@@ -5545,7 +6049,7 @@ void Analyzer::restoreLoopSnapshot(
   // LI.getLoopFor(BB)) in OwnedLoopFieldPhis, which this cleanup does NOT
   // pop. Were a non-header in-loop merge to bypass that cache (landing its
   // PHI in OwnedPhis), the next iteration's mergeStates(Header) would read a
-  // dangling Value* through the preserved BlockExits[BB] — use-after-free.
+  // dangling Value* through the preserved BlockExits[BB] - use-after-free.
   // This check makes that regression deterministic.
   assert((([&] {
            SmallPtrSet<Value *, 16> ToDelete;
@@ -5576,9 +6080,9 @@ void Analyzer::restoreLoopSnapshot(
          "must be cached via getOrCreateLoopFieldPhi, not OwnedPhis");
 
   // Pop and delete unparented PHIs / insts created during the rolled-back
-  // iteration. OwnedLoopFieldPhis are NOT touched — they're the per-loop
+  // iteration. OwnedLoopFieldPhis are NOT touched - they're the per-loop
   // PHI cache, and the whole point of the cache is to keep them alive
-  // across iterations.
+  // across loop-fixpoint rollback.
   while (Result.OwnedPhis.size() > S.OwnedPhisSize) {
     WeakTrackingVH &VH = Result.OwnedPhis.back();
     if (Value *V = VH) {
@@ -5620,7 +6124,7 @@ void Analyzer::restoreLoopSnapshot(
   // or not) is cached and survives this rollback. Were a non-header in-loop
   // merge to bypass the cache, its PHI would land in OwnedPhis and be deleted
   // by the cleanup above while the preserved BlockExits[BB] still references
-  // it — the debug assert earlier in this function guards exactly this.
+  // it - the debug assert earlier in this function guards exactly this.
   for (BasicBlock *BB : LoopBlocks) {
     auto SF = S.SavedBlockEffects.find(BB);
     if (S.HadBlockEffects.count(BB))

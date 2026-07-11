@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; Three-object cycle (o.f = p, p.g = q, q.h = o) on the per-pred path. The
 ; cycle's back edge q.h = o (o materialized last in the cascade) resolves to a
@@ -33,9 +33,9 @@ left:
 right:
   br label %merge
 merge:
-  call void @sink(ptr addrspace(1) %o)
-  call void @sink(ptr addrspace(1) %p)
-  call void @sink(ptr addrspace(1) %q)
+  call void @sink(ptr addrspace(1) %o) [ "deopt"(i32 0, i32 0) ]
+  call void @sink(ptr addrspace(1) %p) [ "deopt"(i32 0, i32 0) ]
+  call void @sink(ptr addrspace(1) %q) [ "deopt"(i32 0, i32 0) ]
   ret void
 u:
   %lp = landingpad i64 cleanup

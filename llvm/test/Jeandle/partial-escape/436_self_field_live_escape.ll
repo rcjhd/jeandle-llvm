@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; Self-referential field (o.f = o) on the LIVE (single escape-point) path. This
 ; path already used OrigAlloc as the field-replay value and worked before; it is
@@ -16,7 +16,7 @@ entry:
 cont:
   %slot = getelementptr inbounds i8, ptr addrspace(1) %o, i64 8
   store atomic ptr addrspace(1) %o, ptr addrspace(1) %slot unordered, align 8
-  call void @sink(ptr addrspace(1) %o)
+  call void @sink(ptr addrspace(1) %o) [ "deopt"(i32 0, i32 0) ]
   ret void
 u:
   %lp = landingpad i64 cleanup

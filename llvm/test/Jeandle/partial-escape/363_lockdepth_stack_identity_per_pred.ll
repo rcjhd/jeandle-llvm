@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; Lock-stack identity mismatch at a diamond merge.
 ;
@@ -20,6 +20,8 @@ declare hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
+declare hotspotcc void @jeandle.safepoint_poll()
+
 define void @test_lockdepth_stack_identity_per_pred(i1 %cond) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
   %lock_t = alloca i64, align 8
@@ -28,11 +30,13 @@ entry:
             ptr inttoptr (i64 9999 to ptr), i32 16)
        to label %dispatch unwind label %u
 dispatch:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br i1 %cond, label %t, label %e
 t:
   ; Then-arm enter on its own call site (proxy depth 0 — RPO visits %t first).
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
                   ptr addrspace(1) %o, ptr %lock_t)
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %merge
 e:
   ; Else-arm enter on a DIFFERENT call site (proxy depth 1 — %e is visited
@@ -41,14 +45,16 @@ e:
   ; mismatch alone routes to per-pred materialise).
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
                   ptr addrspace(1) %o, ptr %lock_e)
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %merge
 merge:
   ; Both preds hold one lock on %o; downstream observes the merged pointer.
-  call void @sink(ptr addrspace(1) %o)
+  call void @sink(ptr addrspace(1) %o) [ "deopt"(i32 0, i32 0) ]
   ; Note: there is no balanced monitorexit on the merged path on purpose;
   ; we are only checking the merge-time mat behaviour, and the per-pred
   ; enters survive in IR with their first operand RAUW'd onto the matching
   ; pred-side materialised pointer.
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   ret void
 u:
   %lp = landingpad i64 cleanup

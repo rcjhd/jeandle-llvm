@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; Three preds joining at the same merge with lock counts
 ; 0 / 1 / 2 on the same virtual object.
@@ -25,6 +25,8 @@ declare hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), pt
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
+declare hotspotcc void @jeandle.safepoint_poll()
+
 define void @test_lock_mismatch_three_preds(i32 %sel) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
   %lock = alloca i64, align 8
@@ -32,22 +34,27 @@ entry:
             ptr inttoptr (i64 12345 to ptr), i32 16)
        to label %switchblk unwind label %u
 switchblk:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   switch i32 %sel, label %c0 [ i32 1, label %c1
                                i32 2, label %c2 ]
 c0:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %merge
 c1:
   call hotspotcc void @jeandle.monitorenter_with_thin_lock(
               ptr addrspace(1) %o, ptr %lock)
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %merge
 c2:
   call hotspotcc void @jeandle.monitorenter_with_thin_lock(
               ptr addrspace(1) %o, ptr %lock)
   call hotspotcc void @jeandle.monitorenter_with_thin_lock(
               ptr addrspace(1) %o, ptr %lock)
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %merge
 merge:
-  call void @sink(ptr addrspace(1) %o)
+  call void @sink(ptr addrspace(1) %o) [ "deopt"(i32 0, i32 0) ]
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   ret void
 u:
   %lp = landingpad i64 cleanup

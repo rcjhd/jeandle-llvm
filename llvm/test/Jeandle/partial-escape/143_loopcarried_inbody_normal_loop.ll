@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 ;
 ; A loop-LOCAL object %X allocated in the body is carried across the back-edge
 ; by the header pointer-PHI %px and escapes at the loop exit (@sink). The field
@@ -18,13 +18,17 @@ declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
+declare hotspotcc void @jeandle.safepoint_poll()
+
 define void @test_143_inbody_carried(i32 %n) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %hdr
 hdr:
   %i = phi i32 [ 0, %entry ], [ %i1, %latch ]
   %px = phi ptr addrspace(1) [ null, %entry ], [ %X, %latch ]
   %c = icmp slt i32 %i, %n
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br i1 %c, label %body, label %exit
 body:
   %X = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
@@ -33,17 +37,22 @@ body:
 bcont:
   %sf = getelementptr inbounds i8, ptr addrspace(1) %X, i64 8
   store atomic i32 %i, ptr addrspace(1) %sf unordered, align 4
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %latch
 latch:
   %i1 = add i32 %i, 1
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %hdr
 exit:
   %ec = icmp eq ptr addrspace(1) %px, null
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br i1 %ec, label %done, label %obs
 obs:
-  call void @sink(ptr addrspace(1) %px)
+  call void @sink(ptr addrspace(1) %px) [ "deopt"(i32 0, i32 0) ]
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %done
 done:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   ret void
 u:
   %lp = landingpad i64 cleanup

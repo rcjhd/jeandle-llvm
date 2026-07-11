@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; Loop-body partial escape, Case B with a loop-LOCAL allocation: the object is
 ; allocated INSIDE the loop, used virtually on the normal path (field store +
@@ -13,12 +13,16 @@ declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i32)
 declare i32 @__gxx_personality_v0(...)
 
+declare hotspotcc void @jeandle.safepoint_poll()
+
 define ptr addrspace(1) @test_loopbody_local_escape(i32 %n) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %loop
 loop:
   %i = phi i32 [ 0, %entry ], [ %i1, %cont ]
   %c = icmp slt i32 %i, %n
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br i1 %c, label %body, label %exit
 body:
   %o = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
@@ -28,15 +32,19 @@ st:
   %s = getelementptr inbounds i8, ptr addrspace(1) %o, i64 8
   store atomic i32 %i, ptr addrspace(1) %s unordered, align 4
   %ce = icmp eq i32 %i, 7
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br i1 %ce, label %ret, label %cont
 ret:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   ret ptr addrspace(1) %o
 cont:
   %v = load atomic i32, ptr addrspace(1) %s unordered, align 4
   call void @use(i32 %v)
   %i1 = add i32 %i, 1
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %loop
 exit:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   ret ptr addrspace(1) null
 u:
   %lp = landingpad i64 cleanup

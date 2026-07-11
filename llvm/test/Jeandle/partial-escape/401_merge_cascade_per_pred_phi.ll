@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; Regression test for the MergeProcessor fast-path move (align with Graal
 ; PartialEscapeClosure.java:935). Two preds join at %merge with lock counts
@@ -26,6 +26,8 @@ declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)
 declare i32 @__gxx_personality_v0(...)
 
+declare hotspotcc void @jeandle.safepoint_poll()
+
 define ptr addrspace(1) @test_merge_cascade_per_pred_phi(i1 %c)
     gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
@@ -34,14 +36,18 @@ entry:
             ptr inttoptr (i64 12345 to ptr), i32 16)
        to label %branch unwind label %u
 branch:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br i1 %c, label %left, label %right
 left:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %merge
 right:
   call hotspotcc void @jeandle.monitorenter_with_thin_lock(
               ptr addrspace(1) %o, ptr %lock)
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %merge
 merge:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   ret ptr addrspace(1) %o
 u:
   %lp = landingpad i64 cleanup

@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; Mixed forward and back edges among three objects: A.f = B and B.g = C are
 ; forward (B, C materialized before their referrers), while C.h = A is a back
@@ -8,6 +8,8 @@
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare i32 @__gxx_personality_v0(...)
+
+declare hotspotcc void @jeandle.safepoint_poll()
 
 define ptr addrspace(1) @cyclic_and_forward_chain_mixed()
     gc "hotspotgc" personality ptr @__gxx_personality_v0 {
@@ -24,6 +26,7 @@ nc:
   store atomic ptr addrspace(1) %c, ptr addrspace(1) %sb unordered, align 8
   %sc = getelementptr inbounds i8, ptr addrspace(1) %c, i64 16
   store atomic ptr addrspace(1) %a, ptr addrspace(1) %sc unordered, align 8
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   ret ptr addrspace(1) %a
 u1:
   %lp1 = landingpad i64 cleanup

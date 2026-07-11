@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; Case-A CASCADE: two objects %o1 (array) and %o2 (instance), both virtual on
 ; `else` and absent on `then`, both Case-A-materialized at `else`'s terminator
@@ -16,25 +16,31 @@ declare hotspotcc i32 @jeandle.arraylength(ptr addrspace(1) readonly)
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
+declare hotspotcc void @jeandle.safepoint_poll()
+
 define void @casea_folded_invoke_term_cascade(i1 %c) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
-  %o1 = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 12345 to ptr), i32 7, i32 44, i32 16, i32 1048576) to label %n1 unwind label %u1
+  %o1 = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 12345 to ptr), i32 7, i32 44, i32 16, i32 1024) to label %n1 unwind label %u1
 n1:
   %o2 = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 22222 to ptr), i32 16) to label %n2 unwind label %u2
 n2:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br i1 %c, label %then, label %else
 then:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %merge
 else:
   ; arraylength reads %o1 (virtual) -> folds, erasing this invoke (else's
   ; terminator). Both %o1 and %o2 are virtual here, absent on `then` -> two
   ; Case-A materializes at the same erased terminator (cascade group).
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   %len = invoke hotspotcc i32 @jeandle.arraylength(ptr addrspace(1) %o1) to label %merge unwind label %handler
 merge:
   %p1 = phi ptr addrspace(1) [ null, %then ], [ %o1, %else ]
   %p2 = phi ptr addrspace(1) [ null, %then ], [ %o2, %else ]
-  call void @sink(ptr addrspace(1) %p1)
-  call void @sink(ptr addrspace(1) %p2)
+  call void @sink(ptr addrspace(1) %p1) [ "deopt"(i32 0, i32 0) ]
+  call void @sink(ptr addrspace(1) %p2) [ "deopt"(i32 0, i32 0) ]
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   ret void
 handler:
   %lp = landingpad i64 cleanup
@@ -54,13 +60,13 @@ u2:
 ; The two materializations chain at the `br` (re-aimed off the erased
 ; arraylength-invoke terminator): else -> pea.mat -> mat.cont -> pea.mat2.
 ; CHECK: else:
-; CHECK-NEXT: %{{.*}} = invoke hotspotcc{{.*}}@jeandle.new_array(ptr inttoptr (i64 12345 to ptr), i32 7, i32 44, i32 16, i32 1048576)
+; CHECK-NEXT: %{{.*}} = invoke hotspotcc{{.*}}@jeandle.new_array(ptr inttoptr (i64 12345 to ptr), i32 7, i32 44, i32 16, i32 1024)
 ; CHECK-NEXT: to label %mat.cont unwind label %u1
 ; CHECK: mat.cont:
 ; CHECK-NEXT: %{{.*}} = invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 22222 to ptr), i32 16)
 ; CHECK-NEXT: to label %mat.cont{{.*}} unwind label %u2
 ; CHECK: mat.cont{{.*}}:
-; CHECK-NEXT: br label %merge
+; CHECK: br label %merge
 ; CHECK: merge:
 ; CHECK: %p1 = phi ptr addrspace(1) [ null, %{{.*}} ], [ %{{.*}}, %mat.cont{{.*}} ]
 ; CHECK: %p2 = phi ptr addrspace(1) [ null, %{{.*}} ], [ %{{.*}}, %mat.cont{{.*}} ]

@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; MergeProcessor / materializeAndBuildPhi lock-count mismatch (1 vs 2).
 ;
@@ -20,6 +20,8 @@ declare hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), pt
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
+declare hotspotcc void @jeandle.safepoint_poll()
+
 define void @test_lockmismatch_1v2(i1 %c) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
   %lock = alloca i64, align 8
@@ -27,19 +29,23 @@ entry:
             ptr inttoptr (i64 12345 to ptr), i32 16)
        to label %branch unwind label %u
 branch:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br i1 %c, label %then, label %else
 then:
   call hotspotcc void @jeandle.monitorenter_with_thin_lock(
               ptr addrspace(1) %o, ptr %lock)
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %merge
 else:
   call hotspotcc void @jeandle.monitorenter_with_thin_lock(
               ptr addrspace(1) %o, ptr %lock)
   call hotspotcc void @jeandle.monitorenter_with_thin_lock(
               ptr addrspace(1) %o, ptr %lock)
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %merge
 merge:
-  call void @sink(ptr addrspace(1) %o)
+  call void @sink(ptr addrspace(1) %o) [ "deopt"(i32 0, i32 0) ]
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   ret void
 u:
   %lp = landingpad i64 cleanup

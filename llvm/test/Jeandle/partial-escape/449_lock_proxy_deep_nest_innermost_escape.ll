@@ -43,7 +43,7 @@ nc:
                   ptr addrspace(1) %b, ptr %lb)
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
                   ptr addrspace(1) %c, ptr %lc)
-  call void @sink(ptr addrspace(1) %c)
+  call void @sink(ptr addrspace(1) %c) [ "deopt"(i32 0, i32 0) ]
   call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(
                   ptr addrspace(1) %c, ptr %lc)
   call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(

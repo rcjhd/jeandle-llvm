@@ -1,17 +1,10 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; DeoptBundleSource prefers the escape-point CallBase when it carries a
-; "deopt" bundle. The analyzer's DeoptBundleSource still reflects this
-; preference (so the future Jeandle deopt refactor can engage with the
-; bundle properly), but the transform is intentionally deopt-agnostic:
-; it filters "deopt" out when copying bundles onto NewInv. So even
-; though the sink carries a rich "deopt" bundle and the allocation has
-; none, the materialization invoke must end up with no operand bundles
-; at all, and the sink's "deopt" operand referencing the
-; about-to-be-deleted OrigAlloc must be scrubbed to null before the
-; global RAUW (otherwise the verifier would see a self-reference once
-; OrigAlloc is replaced by NewInv).
-
+; "deopt" bundle. The materialization invoke must inherit that bundle so the
+; allocation inserted at the escape point has the same deoptimization state;
+; the original sink also keeps its bundle and its object operand is resolved to
+; the new materialized pointer.
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
@@ -24,7 +17,7 @@ entry:
        to label %n unwind label %u
 n:
   ; Rich "deopt" bundle on the sink — this is what must be carried over.
-  call void @sink(ptr addrspace(1) %o) [ "deopt"(i32 42) ]
+  call void @sink(ptr addrspace(1) %o) [ "deopt"(i32 42, i32 42) ]
   ret void
 u:
   %lp = landingpad i64 cleanup
@@ -32,7 +25,8 @@ u:
 }
 
 ; CHECK-LABEL: define void @escape_with_bundle
-; CHECK: %pea.mat = invoke {{.*}}@jeandle.new_instance(ptr {{.*}}, i32 16)
+; CHECK: %pea.mat = invoke {{.*}}@jeandle.new_instance(ptr {{.*}}, i32 16) [ "deopt"(i32 42, i32 42) ]
 ; CHECK-NEXT: to label %{{.*}} unwind label %{{.*}}
+; CHECK: call void @sink(ptr addrspace(1) %pea.mat) [ "deopt"(i32 42, i32 42) ]
 
 !java-method-compilation = !{}

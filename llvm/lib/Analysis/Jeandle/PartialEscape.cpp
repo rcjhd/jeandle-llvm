@@ -612,6 +612,10 @@ void PEAResult::addBlockEffect(std::unique_ptr<Effect> E) {
   BlockEffects[BB].add(std::move(E));
 }
 
+Instruction *EliminateAllocationEffect::getTarget() const {
+  return dyn_cast_or_null<Instruction>(static_cast<Value *>(Target));
+}
+
 void Effect::dump(raw_ostream &OS) const {
   OS << "PEA: ";
   switch (getKind()) {
@@ -629,6 +633,9 @@ void Effect::dump(raw_ostream &OS) const {
     break;
   case Kind::Materialize:
     OS << "Materialize";
+    break;
+  case Kind::RecordDeoptState:
+    OS << "RecordDeoptState";
     break;
   case Kind::CreatePHI:
     OS << "CreatePHI";

@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; Generic dispatch fallback (processInstruction): an UNHANDLED call consuming a
 ; derived-GEP operand of a virtual object. Materialising at the call would
@@ -25,7 +25,7 @@ entry:
 n:
   %g = getelementptr inbounds i8, ptr addrspace(1) %o, i64 16
   store atomic i32 42, ptr addrspace(1) %g unordered, align 4
-  call void @external(ptr addrspace(1) %g)
+  call void @external(ptr addrspace(1) %g) [ "deopt"(i32 0, i32 0) ]
   ret void
 u:
   %lp = landingpad i64 cleanup
@@ -39,7 +39,7 @@ entry:
          to label %n unwind label %u
 n:
   %g = getelementptr inbounds i8, ptr addrspace(1) %o, i64 0
-  call void @external(ptr addrspace(1) %g)
+  call void @external(ptr addrspace(1) %g) [ "deopt"(i32 0, i32 0) ]
   ret void
 u:
   %lp = landingpad i64 cleanup
@@ -52,7 +52,7 @@ entry:
             ptr inttoptr (i64 12345 to ptr), i32 32)
          to label %n unwind label %u
 n:
-  call void @external(ptr addrspace(1) %o)
+  call void @external(ptr addrspace(1) %o) [ "deopt"(i32 0, i32 0) ]
   ret void
 u:
   %lp = landingpad i64 cleanup

@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; Two virtual-locked objects escaping at separate points.
 ;
@@ -34,9 +34,9 @@ n2:
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
                   ptr addrspace(1) %b, ptr %lb)
   ; Escape A first.
-  call void @sink(ptr addrspace(1) %a)
+  call void @sink(ptr addrspace(1) %a) [ "deopt"(i32 0, i32 0) ]
   ; Escape B later.
-  call void @sink(ptr addrspace(1) %b)
+  call void @sink(ptr addrspace(1) %b) [ "deopt"(i32 0, i32 0) ]
   ret void
 u:
   %lp = landingpad i64 cleanup

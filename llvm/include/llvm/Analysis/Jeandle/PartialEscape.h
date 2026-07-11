@@ -99,7 +99,7 @@ struct MonitorIdRef {
 // BytecodeDepth is the ascending re-emit sort key (Graal getLockDepth).
 struct MaterializedLock {
   Function *Callee = nullptr;
-  SmallVector<Value *, 2> NonReceiverArgs;
+  SmallVector<WeakTrackingVH, 2> NonReceiverArgs;
   uint32_t BytecodeDepth = 0;
 };
 
@@ -116,7 +116,7 @@ struct MaterializedLock {
 class MaterializeEffect;
 struct MergedLock {
   Function *Callee = nullptr;
-  SmallVector<Value *, 2> NonReceiverArgs;
+  SmallVector<WeakTrackingVH, 2> NonReceiverArgs;
   uint32_t BytecodeDepth = 0;
   const MaterializeEffect *SourceEffect = nullptr; // per-effect receiver key
 };
@@ -456,11 +456,10 @@ public:
 // 1.6  Effects
 //
 // Graal's PEA models an IR mutation as an `Effect` (EffectList.java):
-//   - abstract base `Effect` with `isVisible()`, `isCfgKill()`,
+//   - abstract base `Effect` with `isCfgKill()`,
 //     `apply(graph, obsoleteNodes)`, `format()`;
 //   - concrete effects are anonymous subclasses, one per mutation kind,
-//     categorized by `isCfgKill()` (drives the two-pass apply) and
-//     `isVisible()` (logging only);
+//     categorized by `isCfgKill()` (drives the two-pass apply);
 //   - stored per-block in a `GraphEffectList` (EffectList subclass) and
 //     applied in two passes — non-cfgKill first, cfgKill second — driven
 //     entirely by `isCfgKill()`.
@@ -487,6 +486,7 @@ public:
     EliminateStore,
     EliminateAllocation,
     Materialize,
+    RecordDeoptState,
     CreatePHI,
     RewritePhiIncoming,
   };
@@ -517,10 +517,6 @@ public:
   // CreatePHI (PHI insertion) DO rewrite control flow but run in the first
   // pass — they are not cfg-kill in Graal's apply-ordering sense.
   virtual bool isCfgKill() const { return false; }
-  // Graal isVisible(): logging only. Jeandle has no deopt-internal effects
-  // (Graal's addVirtualMapping/updateVirtualMapping/addLog), so all visible.
-  virtual bool isVisible() const { return true; }
-
   virtual Kind getKind() const = 0;
 
   // The IR instruction this effect rewrites/erases, or null for effects that
@@ -597,14 +593,14 @@ public:
 // Graal analog: deleteNode (WithExceptionNode) / killIfBranch.
 class EliminateAllocationEffect : public Effect {
 public:
-  Instruction *Target = nullptr;
+  WeakTrackingVH Target;
 
   Kind getKind() const override { return Kind::EliminateAllocation; }
   static bool classof(const Effect *E) {
     return E->getKind() == Kind::EliminateAllocation;
   }
   bool isCfgKill() const override { return true; }
-  Instruction *getTarget() const override { return Target; }
+  Instruction *getTarget() const override;
   void apply(TransformContext &Ctx) override;
   std::unique_ptr<Effect> clone() const override {
     return std::make_unique<EliminateAllocationEffect>(*this);
@@ -618,10 +614,45 @@ public:
 class MaterializeEffect : public Effect {
 public:
   // Per-offset snapshot of a virtual object's field values at a
-  // materialization point.
+  // materialization point. Store pointer-valued entries through tracking
+  // handles: materialization effects are produced during analysis but applied
+  // after earlier transform effects may have erased folded loads/calls. A raw
+  // Value* here can therefore dangle and corrupt the replayed field store.
   struct FieldEntry {
-    int64_t Offset;
-    FieldValue Value;
+    int64_t Offset = 0;
+    FieldValue::Tag T = FieldValue::Unknown;
+    WeakTrackingVH V;
+    ObjectID Ref = InvalidObjectID;
+
+    FieldEntry() = default;
+    FieldEntry(int64_t Offset, const FieldValue &FV) : Offset(Offset) {
+      if (FV.isScalar()) {
+        T = FieldValue::Scalar;
+        V = FV.getScalar();
+      } else if (FV.isMaterializedRef()) {
+        T = FieldValue::MaterializedRef;
+        V = FV.getMaterialized();
+      } else if (FV.isVirtualRef()) {
+        T = FieldValue::VirtualRef;
+        Ref = FV.getVirtualRef();
+      }
+    }
+
+    bool isScalar() const { return T == FieldValue::Scalar; }
+    bool isMaterializedRef() const { return T == FieldValue::MaterializedRef; }
+    bool isVirtualRef() const { return T == FieldValue::VirtualRef; }
+    Value *getScalar() const {
+      assert(isScalar());
+      return static_cast<Value *>(V);
+    }
+    Value *getMaterialized() const {
+      assert(isMaterializedRef());
+      return static_cast<Value *>(V);
+    }
+    ObjectID getVirtualRef() const {
+      assert(isVirtualRef());
+      return Ref;
+    }
   };
 
   // WeakTrackingVH so erasing the insertion-point instruction auto-nulls the
@@ -633,7 +664,10 @@ public:
   // (Graal: synthetic MonitorEnterNodes at the CommitAllocationNode), sorted
   // ascending by BytecodeDepth.
   SmallVector<MaterializedLock, 2> Locks;
-  Instruction *DeoptBundleSource = nullptr;
+  // The call whose deopt bundle should be copied onto the materialization
+  // invoke. Kept as a tracking handle because the transform may erase a folded
+  // JavaOp before this MaterializeEffect is applied.
+  WeakTrackingVH DeoptBundleSource;
   bool IsPerPred = false;
   Value *PerPredPlaceholder = nullptr;
   // The target merge block this per-pred materialize is destined for (the merge
@@ -666,13 +700,76 @@ public:
   void setInsertBefore(Instruction *I);
 };
 
+// Capture the virtual-object state referenced by one call's deopt operand
+// bundle. The transform consumes this state and rewrites the bundle to
+// lazy-object records, so deoptimization can reallocate the eliminated object
+// without forcing normal-path materialization.
+class RecordDeoptStateEffect : public Effect {
+public:
+  struct FieldSnapshot {
+    int64_t Offset = 0;
+    FieldValue::Tag T = FieldValue::Unknown;
+    WeakTrackingVH V;
+    ObjectID Ref = InvalidObjectID;
+
+    FieldSnapshot() = default;
+    FieldSnapshot(int64_t Offset, const FieldValue &FV) : Offset(Offset) {
+      if (FV.isScalar()) {
+        T = FieldValue::Scalar;
+        V = FV.getScalar();
+      } else if (FV.isMaterializedRef()) {
+        T = FieldValue::MaterializedRef;
+        V = FV.getMaterialized();
+      } else if (FV.isVirtualRef()) {
+        T = FieldValue::VirtualRef;
+        Ref = FV.getVirtualRef();
+      }
+    }
+
+    bool isScalar() const { return T == FieldValue::Scalar; }
+    bool isMaterializedRef() const { return T == FieldValue::MaterializedRef; }
+    bool isVirtualRef() const { return T == FieldValue::VirtualRef; }
+    Value *getScalar() const {
+      assert(isScalar());
+      return static_cast<Value *>(V);
+    }
+    Value *getMaterialized() const {
+      assert(isMaterializedRef());
+      return static_cast<Value *>(V);
+    }
+    ObjectID getVirtualRef() const {
+      assert(isVirtualRef());
+      return Ref;
+    }
+  };
+
+  struct ObjectSnapshot {
+    ObjectID ID = InvalidObjectID;
+    SmallVector<WeakTrackingVH, 2> Values;
+    SmallVector<FieldSnapshot, 8> FieldEntries;
+  };
+
+  Instruction *Target = nullptr;
+  ObjectSnapshot Snapshot;
+
+  Kind getKind() const override { return Kind::RecordDeoptState; }
+  static bool classof(const Effect *E) {
+    return E->getKind() == Kind::RecordDeoptState;
+  }
+  Instruction *getTarget() const override { return Target; }
+  void apply(TransformContext &Ctx) override;
+  std::unique_ptr<Effect> clone() const override {
+    return std::make_unique<RecordDeoptStateEffect>(*this);
+  }
+};
+
 // Insert an analyzer-built unparented PHINode at a merge block and wire its
 // incomings. Non-cfgKill (Pass 1). Graal analog: addFloatingNode + setPhiInput
 // (initializePhiInput).
 class CreatePHIEffect : public Effect {
 public:
   Type *PHIType = nullptr;
-  SmallVector<Value *, 4> PHIIncomingValues;
+  SmallVector<WeakTrackingVH, 4> PHIIncomingValues;
   SmallVector<BasicBlock *, 4> PHIIncomingBlocks;
   PHINode *PhiInst = nullptr;
   bool RAUWOrigToPHI = false;
@@ -876,7 +973,7 @@ public:
   // PHI across iterations; only the per-iteration CreatePHI Effect is rebuilt.
   // Non-header in-loop merges are included because restoreLoopSnapshot
   // preserves BlockExits[BB] for every loop block across iterations, so any
-  // Value* reachable from a preserved BlockExits[BB] must outlive rollback —
+  // Value* reachable from a preserved BlockExits[BB] must outlive rollback -
   // were such a PHI to land in OwnedPhis (which IS truncated), the preserved
   // BlockExits[BB] would reference a deleted PHI. Lifecycle is identical to
   // OwnedPhis.

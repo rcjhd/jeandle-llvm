@@ -1,5 +1,5 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -verify-each %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" -verify-each %s | FileCheck %s
 ;
 ; §1.4 deepest/nearest-dominating-def selection in resolveMaterializedUses.
 ;
@@ -44,10 +44,10 @@ obody:
 arm:
   br i1 %c, label %a1, label %a2
 a1:
-  call void @sink(ptr addrspace(1) %X)
+  call void @sink(ptr addrspace(1) %X) [ "deopt"(i32 0, i32 0) ]
   br label %amrg
 a2:
-  call void @sink(ptr addrspace(1) %X)
+  call void @sink(ptr addrspace(1) %X) [ "deopt"(i32 0, i32 0) ]
   br label %amrg
 amrg:
   call void @use(ptr addrspace(1) %X)
@@ -56,7 +56,7 @@ olatch:
   %oi1 = add i32 %oi, 1
   br label %ohdr
 oexit:
-  call void @sink(ptr addrspace(1) %px)
+  call void @sink(ptr addrspace(1) %px) [ "deopt"(i32 0, i32 0) ]
   ret void
 u:
   %lp = landingpad i64 cleanup

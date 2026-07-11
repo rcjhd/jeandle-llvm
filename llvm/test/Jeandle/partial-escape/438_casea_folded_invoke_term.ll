@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; Case-A (processBlockPhis, SkipGlobalRAUW=false, IsPerPred=false) materializes
 ; %o at `else`'s TERMINATOR, which is a folded JavaOp invoke (jeandle.arraylength
@@ -17,24 +17,30 @@ declare hotspotcc i32 @jeandle.arraylength(ptr addrspace(1) readonly)
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
+declare hotspotcc void @jeandle.safepoint_poll()
+
 define void @casea_folded_invoke_term(i1 %c) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
   %o = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 12345 to ptr), i32 7, i32 44, i32 16, i32 1048576)
          to label %n unwind label %u
 n:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br i1 %c, label %then, label %else
 then:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %merge
 else:
   ; arraylength on the virtual %o folds -> ReplaceCall erases this invoke
   ; (else's terminator). else has two successors (merge, handler).
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   %len = invoke hotspotcc i32 @jeandle.arraylength(ptr addrspace(1) %o)
               to label %merge unwind label %handler
 merge:
   ; PHI mixing %o virtual (else arm) and null (then arm) -> Case-A materialize
   ; of %o at else's terminator (the erased arraylength invoke).
   %p = phi ptr addrspace(1) [ null, %then ], [ %o, %else ]
-  call void @sink(ptr addrspace(1) %p)
+  call void @sink(ptr addrspace(1) %p) [ "deopt"(i32 0, i32 0) ]
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   ret void
 handler:
   %lp = landingpad i64 cleanup
@@ -55,6 +61,6 @@ u:
 ; CHECK-NEXT: %{{.*}} = invoke hotspotcc{{.*}}@jeandle.new_array(ptr inttoptr (i64 12345 to ptr), i32 7, i32 44, i32 16, i32 1048576)
 ; CHECK-NEXT: to label %mat.cont unwind label %u
 ; CHECK: mat.cont:
-; CHECK-NEXT: br label %merge
+; CHECK: br label %merge
 ; CHECK: merge:
 ; CHECK: %p = phi ptr addrspace(1) [ null, %{{.*}} ], [ %{{.*}}, %mat.cont ]

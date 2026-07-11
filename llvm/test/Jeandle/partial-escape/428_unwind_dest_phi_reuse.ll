@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; findOrSynthesizeUnwindDest PHI reuse. %uw has TWO invoke
 ; predecessors (the alloc %o and a second invoke) and a USED PHI over them.
@@ -23,7 +23,7 @@ entry:
 cont:
   invoke void @may_throw() to label %escape unwind label %uw
 escape:
-  call void @sink(ptr addrspace(1) %o)
+  call void @sink(ptr addrspace(1) %o) [ "deopt"(i32 0, i32 0) ]
   ret void
 uw:
   %sel = phi i32 [ 0, %entry ], [ 1, %cont ]

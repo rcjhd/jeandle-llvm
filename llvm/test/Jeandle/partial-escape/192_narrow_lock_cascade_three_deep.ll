@@ -40,7 +40,7 @@ nc:
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
                   ptr addrspace(1) %c, ptr %lock_c)
   ; The middle one escapes.
-  call void @sink(ptr addrspace(1) %b)
+  call void @sink(ptr addrspace(1) %b) [ "deopt"(i32 0, i32 0) ]
   call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(
                   ptr addrspace(1) %c, ptr %lock_c)
   call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(

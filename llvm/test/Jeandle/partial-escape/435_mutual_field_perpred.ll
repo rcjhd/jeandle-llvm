@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; Mutual reference (o.f = p, p.g = o) on the per-pred path. Both edges must
 ; resolve to real per-pred NewInvs: the transform emits every cascade NewInv
@@ -30,8 +30,8 @@ left:
 right:
   br label %merge
 merge:
-  call void @sink(ptr addrspace(1) %o)
-  call void @sink(ptr addrspace(1) %p)
+  call void @sink(ptr addrspace(1) %o) [ "deopt"(i32 0, i32 0) ]
+  call void @sink(ptr addrspace(1) %p) [ "deopt"(i32 0, i32 0) ]
   ret void
 u:
   %lp = landingpad i64 cleanup

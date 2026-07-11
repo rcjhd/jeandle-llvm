@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; §2.1: when a virtual object is materialized at an escape point that sits
 ; inside a Windows-EH funclet, the materialization invoke MUST carry a
@@ -40,7 +40,7 @@ cont:
 
 cleanup:
   %cp = cleanuppad within none []
-  call void @sink(ptr addrspace(1) %o) [ "funclet"(token %cp) ]
+  call void @sink(ptr addrspace(1) %o) [ "deopt"(i32 0, i32 0), "funclet"(token %cp) ]
   cleanupret from %cp unwind to caller
 
 ehalloc:
@@ -51,6 +51,6 @@ ehalloc:
 ; CHECK-LABEL: define void @test_funclet_bundle
 ; CHECK: %[[CP:[A-Za-z0-9._]+]] = cleanuppad within none []
 ; The materialization invoke (inside the funclet) carries the enclosing pad.
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 7 to ptr), i32 16){{.*}}[ "funclet"(token %[[CP]]) ]
+; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 7 to ptr), i32 16){{.*}}[ "funclet"(token %[[CP]]), "deopt"(i32 0, i32 0) ]
 
 !java-method-compilation = !{}

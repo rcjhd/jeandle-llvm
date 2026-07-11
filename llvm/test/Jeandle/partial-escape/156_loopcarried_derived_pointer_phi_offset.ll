@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 ;
 ; Regression test for the offset-loss miscompile in Case B/C. An all-derived-
 ; same-object PHI %p = phi [%sf1,%a1],[%sf2,%a2] (both gep %X,8) is used for a
@@ -12,25 +12,31 @@ declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink_i32(i32)
 declare i32 @__gxx_personality_v0(...)
 
+declare hotspotcc void @jeandle.safepoint_poll()
+
 define void @test_156_derived_phi_offset(i1 %c) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
   %X = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
             ptr inttoptr (i64 5555 to ptr), i32 32)
           to label %cont unwind label %u
 cont:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br i1 %c, label %a1, label %a2
 a1:
   %sf1 = getelementptr inbounds i8, ptr addrspace(1) %X, i64 8
   store i32 111, ptr addrspace(1) %sf1
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %m
 a2:
   %sf2 = getelementptr inbounds i8, ptr addrspace(1) %X, i64 8
   store i32 222, ptr addrspace(1) %sf2
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %m
 m:
   %p = phi ptr addrspace(1) [ %sf1, %a1 ], [ %sf2, %a2 ]
   %v = load i32, ptr addrspace(1) %p
   call void @sink_i32(i32 %v)
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   ret void
 u:
   %lp = landingpad i64 cleanup

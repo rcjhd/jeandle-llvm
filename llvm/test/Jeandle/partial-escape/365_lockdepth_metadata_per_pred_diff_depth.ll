@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; Lock-stack identity mismatch at a diamond where each arm enters the SAME
 ; virtual %o via a DISTINCT call site, so the two arms carry DIFFERENT
@@ -15,6 +15,8 @@ declare hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
+declare hotspotcc void @jeandle.safepoint_poll()
+
 define void @test_lockdepth_per_pred_diff_depth(i1 %cond) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
   %lock_t = alloca i64, align 8
@@ -23,21 +25,25 @@ entry:
             ptr inttoptr (i64 8765 to ptr), i32 16)
        to label %dispatch unwind label %u
 dispatch:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br i1 %cond, label %t, label %e
 t:
   ; Then-arm: this enter is the only one on %o on this path. RPO visits %t
   ; first, so the proxy assigns it depth 0.
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
                   ptr addrspace(1) %o, ptr %lock_t)
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %merge
 e:
   ; Else-arm: a DISTINCT call site on %o. RPO visits %e after %t, so the
   ; proxy assigns it depth 1. Different call site, different depth.
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
                   ptr addrspace(1) %o, ptr %lock_e)
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %merge
 merge:
-  call void @sink(ptr addrspace(1) %o)
+  call void @sink(ptr addrspace(1) %o) [ "deopt"(i32 0, i32 0) ]
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   ret void
 u:
   %lp = landingpad i64 cleanup

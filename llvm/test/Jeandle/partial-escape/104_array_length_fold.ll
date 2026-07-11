@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 ;
 ; Regression test: the analyzer picks SafeIP =
 ; computeMaterializationPoint(alloc) = first non-PHI/dbg of the alloc's
@@ -54,7 +54,7 @@ entry:
 n:
   %len = call hotspotcc i32 @jeandle.arraylength(ptr addrspace(1) %arr)
   call void @use(i32 %len)
-  call void @sink(ptr addrspace(1) %arr)
+  call void @sink(ptr addrspace(1) %arr) [ "deopt"(i32 0, i32 0) ]
   ret void
 u:
   %lp = landingpad i64 cleanup

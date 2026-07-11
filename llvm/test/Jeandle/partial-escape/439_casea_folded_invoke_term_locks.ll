@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; Case-A + locks + a folded JavaOp-invoke terminator. The object %o has an
 ; elided monitorenter (depth 0); Case-A materializes %o at `else`'s
@@ -14,6 +14,8 @@ declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
+declare hotspotcc void @jeandle.safepoint_poll()
+
 define void @casea_folded_invoke_term_locks(i1 %c) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
   %lo = alloca i64, align 8
@@ -21,14 +23,18 @@ entry:
          to label %n unwind label %u
 n:
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %o, ptr %lo)
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br i1 %c, label %then, label %else
 then:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %merge
 else:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   %len = invoke hotspotcc i32 @jeandle.arraylength(ptr addrspace(1) %o) to label %merge unwind label %handler
 merge:
   %p = phi ptr addrspace(1) [ null, %then ], [ %o, %else ]
-  call void @sink(ptr addrspace(1) %p)
+  call void @sink(ptr addrspace(1) %p) [ "deopt"(i32 0, i32 0) ]
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   ret void
 handler:
   %lp = landingpad i64 cleanup
@@ -49,4 +55,4 @@ u:
 ; CHECK-NEXT: to label %mat.cont unwind label %u
 ; CHECK: mat.cont:
 ; CHECK-NEXT: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %{{.*}}, ptr %lo)
-; CHECK-NEXT: br label %merge
+; CHECK: br label %merge

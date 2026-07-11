@@ -45,6 +45,7 @@
 #include "llvm/Transforms/Jeandle/PartialEscapeTransform.h"
 
 #include "llvm/ADT/PostOrderIterator.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/Jeandle/PartialEscape.h"
@@ -61,6 +62,7 @@
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Jeandle/Attributes.h"
+#include "llvm/IR/Jeandle/Deoptimization.h"
 #include "llvm/IR/Jeandle/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
@@ -161,6 +163,447 @@ static BasicBlock *findOrSynthesizeUnwindDest(Function &F, CallBase *OrigAlloc,
   return createMinimalUnwindBlock(F, EnclosingPad);
 }
 
+struct LazyDeoptField {
+  // Byte offset within the instance.
+  int64_t Offset = 0;
+  // Debug-info type.
+  jeandle::HotspotBasicType BasicTy = jeandle::T_OBJECT;
+  // Scalar value, or a nested lazy object's debug id.
+  WeakTrackingVH Val;
+
+  LazyDeoptField() = default;
+  LazyDeoptField(int64_t Offset, jeandle::HotspotBasicType BasicTy, Value *Val)
+      : Offset(Offset), BasicTy(BasicTy), Val(Val) {}
+  LazyDeoptField(const LazyDeoptField &O)
+      : Offset(O.Offset), BasicTy(O.BasicTy), Val(static_cast<Value *>(O.Val)) {}
+  LazyDeoptField &operator=(const LazyDeoptField &O) {
+    Offset = O.Offset;
+    BasicTy = O.BasicTy;
+    Val = static_cast<Value *>(O.Val);
+    return *this;
+  }
+  LazyDeoptField(LazyDeoptField &&O) : LazyDeoptField(O) {}
+  LazyDeoptField &operator=(LazyDeoptField &&O) { return *this = O; }
+};
+
+struct LazyDeoptObject {
+  // Serialized as ID + 1.
+  jeandle::ObjectID ID = jeandle::InvalidObjectID;
+  // HotSpot Klass address used for reconstruction.
+  uintptr_t Klass = 0;
+  // SSA aliases matched in the bundle.
+  SmallVector<WeakTrackingVH, 2> Values;
+  // Field state at this deopt point.
+  SmallVector<LazyDeoptField, 8> Fields;
+  // Nested VO records to emit.
+  SmallVector<jeandle::ObjectID, 4> Dependencies;
+
+  LazyDeoptObject() = default;
+  LazyDeoptObject(const LazyDeoptObject &O) { *this = O; }
+  LazyDeoptObject &operator=(const LazyDeoptObject &O) {
+    ID = O.ID;
+    Klass = O.Klass;
+    Values.clear();
+    for (const WeakTrackingVH &VH : O.Values)
+      if (Value *V = VH)
+        Values.emplace_back(V);
+    Fields.assign(O.Fields.begin(), O.Fields.end());
+    Dependencies = O.Dependencies;
+    return *this;
+  }
+  LazyDeoptObject(LazyDeoptObject &&O) : LazyDeoptObject(O) {}
+  LazyDeoptObject &operator=(LazyDeoptObject &&O) { return *this = O; }
+};
+
+using LazyObjectLookup = function_ref<const LazyDeoptObject *(Value *)>;
+using LazyObjectByIDLookup =
+    function_ref<const LazyDeoptObject *(jeandle::ObjectID)>;
+
+static ConstantInt *deoptConst(LLVMContext &Ctx, int Index,
+                               jeandle::DeoptValueEncoding::DeoptValueType VT,
+                               jeandle::HotspotBasicType BT) {
+  uint64_t Enc = jeandle::DeoptValueEncoding(Index, VT, BT).encode();
+  return ConstantInt::get(Type::getInt64Ty(Ctx), Enc);
+}
+
+static ConstantInt *i64Const(LLVMContext &Ctx, uint64_t V) {
+  return ConstantInt::get(Type::getInt64Ty(Ctx), V);
+}
+
+static bool isPoisonOrUndef(Value *V) {
+  return isa<PoisonValue>(V) || isa<UndefValue>(V);
+}
+
+static Constant *nullObjectDebugValue(Value *V) {
+  return Constant::getNullValue(V->getType());
+}
+
+static int lazyObjectDebugId(jeandle::ObjectID ID) {
+  // HotSpot debug info uses constant oop 0 for null, so lazy-object ids must
+  // live in the positive id space. ObjectID is still kept raw internally.
+  return static_cast<int>(ID) + 1;
+}
+
+static Value *resolveValueReplacement(
+    Value *V, const DenseMap<Value *, Value *> &ValueReplacements) {
+  for (unsigned Depth = 0; V && Depth < 8; ++Depth) {
+    auto It = ValueReplacements.find(V);
+    if (It == ValueReplacements.end() || It->second == V)
+      break;
+    V = It->second;
+  }
+  return V;
+}
+
+using DeoptInputNormalizer = function_ref<Value *(Value *)>;
+
+static bool lazyObjectHasValue(const LazyDeoptObject &Obj, Value *V) {
+  if (!V)
+    return false;
+  for (const WeakTrackingVH &VH : Obj.Values)
+    if (static_cast<Value *>(VH) == V)
+      return true;
+  return false;
+}
+
+static std::optional<jeandle::HotspotBasicType> hotspotTypeForDeopt(Value *V) {
+  Type *Ty = V->getType();
+  if (Ty->isPointerTy())
+    return jeandle::T_OBJECT;
+  if (auto *IT = dyn_cast<IntegerType>(Ty)) {
+    unsigned BW = IT->getBitWidth();
+    if (BW <= 32)
+      return jeandle::T_INT;
+    if (BW == 64)
+      return jeandle::T_LONG;
+    return std::nullopt;
+  }
+  if (Ty->isFloatTy())
+    return jeandle::T_FLOAT;
+  if (Ty->isDoubleTy())
+    return jeandle::T_DOUBLE;
+  return std::nullopt;
+}
+
+static void appendLazyDependency(LazyDeoptObject &Obj,
+                                 jeandle::ObjectID ID) {
+  if (ID == jeandle::InvalidObjectID)
+    return;
+  if (!llvm::is_contained(Obj.Dependencies, ID))
+    Obj.Dependencies.push_back(ID);
+}
+
+static void appendLazyDeoptField(
+    LazyDeoptObject &Obj, int64_t Offset, Value *V,
+    const DenseMap<Value *, Value *> &NewAllocFor,
+    const DenseMap<Value *, Value *> &ValueReplacements) {
+  if (!V)
+    return;
+  V = resolveValueReplacement(V, ValueReplacements);
+  if (!V)
+    return;
+  if (auto *VI = dyn_cast<Instruction>(V)) {
+    auto It = NewAllocFor.find(VI);
+    if (It != NewAllocFor.end())
+      V = It->second;
+  }
+  std::optional<jeandle::HotspotBasicType> BT = hotspotTypeForDeopt(V);
+  if (!BT)
+    return;
+  Obj.Fields.push_back({Offset, *BT, V});
+}
+
+static void appendLazyDeoptVirtualField(LazyDeoptObject &Obj, int64_t Offset,
+                                        jeandle::ObjectID ID,
+                                        const jeandle::PEAResult &Result,
+                                        LLVMContext &Ctx) {
+  if (ID == jeandle::InvalidObjectID || ID >= Result.VirtualObjects.size() ||
+      !Result.VirtualObjects[ID])
+    return;
+
+  const jeandle::VirtualObject &Inner = *Result.VirtualObjects[ID];
+  jeandle::HotspotBasicType BT =
+      Inner.isArray() ? jeandle::T_ARRAY : jeandle::T_OBJECT;
+  Obj.Fields.push_back({Offset, BT, i64Const(Ctx, lazyObjectDebugId(ID))});
+  appendLazyDependency(Obj, ID);
+}
+
+static void sortLazyDeoptFields(LazyDeoptObject &Obj) {
+  llvm::sort(Obj.Fields, [](const LazyDeoptField &A, const LazyDeoptField &B) {
+    return A.Offset < B.Offset;
+  });
+}
+
+static LazyDeoptObject buildLazyDeoptObject(
+    const jeandle::VirtualObject &VObj,
+    ArrayRef<jeandle::MaterializeEffect::FieldEntry> FieldEntries,
+    const DenseMap<Value *, Value *> &NewAllocFor,
+    const DenseMap<Value *, Value *> &ValueReplacements) {
+  LazyDeoptObject Obj;
+  Obj.ID = VObj.getID();
+  Obj.Klass = VObj.Klass;
+
+  for (const auto &FE : FieldEntries) {
+    Value *V = nullptr;
+    if (FE.isScalar())
+      V = FE.getScalar();
+    else if (FE.isMaterializedRef())
+      V = FE.getMaterialized();
+    appendLazyDeoptField(Obj, FE.Offset, V, NewAllocFor, ValueReplacements);
+  }
+  sortLazyDeoptFields(Obj);
+  return Obj;
+}
+
+static LazyDeoptObject buildLazyDeoptObject(
+    const jeandle::PEAResult &Result, const jeandle::VirtualObject &VObj,
+    ArrayRef<jeandle::RecordDeoptStateEffect::FieldSnapshot> FieldEntries,
+    const DenseMap<Value *, Value *> &NewAllocFor,
+    const DenseMap<Value *, Value *> &ValueReplacements) {
+  LazyDeoptObject Obj;
+  Obj.ID = VObj.getID();
+  Obj.Klass = VObj.Klass;
+  LLVMContext &Ctx = VObj.AllocationCall->getContext();
+
+  for (const auto &FE : FieldEntries) {
+    if (FE.isScalar()) {
+      appendLazyDeoptField(Obj, FE.Offset, FE.getScalar(), NewAllocFor,
+                           ValueReplacements);
+    } else if (FE.isMaterializedRef()) {
+      appendLazyDeoptField(Obj, FE.Offset, FE.getMaterialized(), NewAllocFor,
+                           ValueReplacements);
+    } else if (FE.isVirtualRef()) {
+      appendLazyDeoptVirtualField(Obj, FE.Offset, FE.getVirtualRef(), Result,
+                                  Ctx);
+    }
+  }
+  sortLazyDeoptFields(Obj);
+  return Obj;
+}
+
+static void appendLazyObjectRecord(SmallVectorImpl<Value *> &Inputs,
+                                   LLVMContext &Ctx,
+                                   const LazyDeoptObject &Obj,
+                                   DenseSet<jeandle::ObjectID> &Emitted,
+                                   LazyObjectByIDLookup LookupByID) {
+  if (!Emitted.insert(Obj.ID).second)
+    return;
+
+  Inputs.push_back(deoptConst(Ctx, lazyObjectDebugId(Obj.ID),
+                              jeandle::DeoptValueEncoding::LazyObjectType,
+                              jeandle::T_OBJECT));
+  Inputs.push_back(i64Const(Ctx, Obj.Klass));
+  SmallVector<const LazyDeoptField *, 8> LiveFields;
+  for (const LazyDeoptField &F : Obj.Fields) {
+    Value *FieldVal = F.Val;
+    assert(FieldVal && "lazy deopt field value was deleted without replacement");
+    if (FieldVal)
+      LiveFields.push_back(&F);
+  }
+  Inputs.push_back(i64Const(Ctx, LiveFields.size()));
+  for (const LazyDeoptField *FP : LiveFields) {
+    const LazyDeoptField &F = *FP;
+    Value *FieldVal = F.Val;
+    Inputs.push_back(i64Const(Ctx, static_cast<uint64_t>(F.Offset)));
+    Inputs.push_back(deoptConst(Ctx, 0,
+                                jeandle::DeoptValueEncoding::LazyObjectFieldType,
+                                F.BasicTy));
+    Inputs.push_back(FieldVal);
+  }
+
+  for (jeandle::ObjectID ID : Obj.Dependencies)
+    if (const LazyDeoptObject *Dep = LookupByID(ID))
+      appendLazyObjectRecord(Inputs, Ctx, *Dep, Emitted, LookupByID);
+}
+
+static bool appendInputRange(ArrayRef<Value *> OldInputs,
+                             SmallVectorImpl<Value *> &Inputs, unsigned Begin,
+                             unsigned End, DeoptInputNormalizer Normalize) {
+  bool Changed = false;
+  for (unsigned I = Begin; I < End; ++I) {
+    Value *Old = OldInputs[I];
+    Value *New = Normalize(Old);
+    assert(New && "deopt input normalizer must preserve a value");
+    if (!New)
+      New = Old;
+    Changed |= New != Old;
+    Inputs.push_back(New);
+  }
+  return Changed;
+}
+
+static bool buildLazyDeoptInputs(ArrayRef<Value *> OldInputs,
+                                 SmallVectorImpl<Value *> &Inputs,
+                                 LLVMContext &Ctx, LazyObjectLookup Lookup,
+                                 LazyObjectByIDLookup LookupByID,
+                                 DeoptInputNormalizer Normalize) {
+  bool Changed = false;
+  DenseSet<jeandle::ObjectID> Emitted;
+  bool AtScopeStart = true;
+
+  auto NormalizeOne = [&](Value *Old) -> Value * {
+    Value *New = Normalize(Old);
+    assert(New && "deopt input normalizer must preserve a value");
+    if (!New)
+      New = Old;
+    Changed |= New != Old;
+    return New;
+  };
+  auto AppendRange = [&](unsigned Begin, unsigned End) {
+    Changed |= appendInputRange(OldInputs, Inputs, Begin, End, Normalize);
+  };
+  auto LookupLazyObject = [&](Value *Old, Value *New)
+      -> const LazyDeoptObject * {
+    if (const LazyDeoptObject *Obj = Lookup(Old))
+      return Obj;
+    if (New != Old)
+      return Lookup(New);
+    return nullptr;
+  };
+
+  for (unsigned I = 0, E = OldInputs.size(); I < E;) {
+    if (AtScopeStart) {
+      assert(jeandle::startsWithDeoptScopeHeader(OldInputs, I) &&
+             "deopt bundle must start with a scope header");
+      unsigned Next = jeandle::skipDeoptScopeHeader(OldInputs, I);
+      AppendRange(I, Next);
+      I = Next;
+      AtScopeStart = false;
+      continue;
+    }
+
+    Value *Cur = OldInputs[I];
+    auto *Encoding = cast<ConstantInt>(Cur);
+    assert(Encoding->getType()->isIntegerTy(64) &&
+           "expected i64 deopt value encoding");
+    jeandle::DeoptValueEncoding Enc =
+        jeandle::DeoptValueEncoding::decode(Encoding->getZExtValue());
+    auto VT = Enc.valueType();
+    bool IsObject = jeandle::isObjectDeoptEncoding(Enc);
+
+    if (VT == jeandle::DeoptValueEncoding::LocalType ||
+        VT == jeandle::DeoptValueEncoding::StackType) {
+      unsigned Next = jeandle::deoptRecordEnd(I, E, 2);
+      if (IsObject) {
+        Value *ObjVal = OldInputs[I + 1];
+        Value *NormObjVal = NormalizeOne(ObjVal);
+        if (isPoisonOrUndef(NormObjVal)) {
+          Inputs.push_back(NormalizeOne(Cur));
+          Inputs.push_back(nullObjectDebugValue(NormObjVal));
+          I = Next;
+          Changed = true;
+          continue;
+        }
+        if (const LazyDeoptObject *Obj =
+                LookupLazyObject(ObjVal, NormObjVal)) {
+          appendLazyObjectRecord(Inputs, Ctx, *Obj, Emitted, LookupByID);
+          Inputs.push_back(NormalizeOne(Cur));
+          Inputs.push_back(i64Const(Ctx, lazyObjectDebugId(Obj->ID)));
+          I = Next;
+          Changed = true;
+          continue;
+        }
+      }
+      AppendRange(I, Next);
+      I = Next;
+      continue;
+    }
+
+    if (VT == jeandle::DeoptValueEncoding::MonitorType) {
+      unsigned Next = jeandle::deoptRecordEnd(I, E, 3);
+      if (IsObject) {
+        Value *ObjVal = OldInputs[I + 1];
+        Value *NormObjVal = NormalizeOne(ObjVal);
+        if (isPoisonOrUndef(NormObjVal)) {
+          Inputs.push_back(NormalizeOne(Cur));
+          Inputs.push_back(nullObjectDebugValue(NormObjVal));
+          Inputs.push_back(NormalizeOne(OldInputs[I + 2]));
+          I = Next;
+          Changed = true;
+          continue;
+        }
+        if (const LazyDeoptObject *Obj =
+                LookupLazyObject(ObjVal, NormObjVal)) {
+          appendLazyObjectRecord(Inputs, Ctx, *Obj, Emitted, LookupByID);
+          Inputs.push_back(NormalizeOne(Cur));
+          Inputs.push_back(i64Const(Ctx, lazyObjectDebugId(Obj->ID)));
+          Inputs.push_back(NormalizeOne(OldInputs[I + 2]));
+          I = Next;
+          Changed = true;
+          continue;
+        }
+      }
+      AppendRange(I, Next);
+      I = Next;
+      continue;
+    }
+
+    if (VT == jeandle::DeoptValueEncoding::LazyObjectType) {
+      assert(I + 2 < E && "truncated lazy-object deopt record");
+      auto *CountC = dyn_cast<ConstantInt>(OldInputs[I + 2]);
+      assert(CountC && "lazy-object field count must be constant");
+      uint64_t FieldCount = CountC->getZExtValue();
+      unsigned Next = jeandle::deoptRecordEnd(I, E, 3 + FieldCount * 3);
+      AppendRange(I, Next);
+      I = Next;
+      continue;
+    }
+
+    if (VT == jeandle::DeoptValueEncoding::OrigPcSlotType ||
+        VT == jeandle::DeoptValueEncoding::MethodType ||
+        VT == jeandle::DeoptValueEncoding::NarrowOopMarkerType) {
+      unsigned Next = jeandle::deoptRecordEnd(I, E, 2);
+      AppendRange(I, Next);
+      I = Next;
+      if (VT == jeandle::DeoptValueEncoding::MethodType)
+        AtScopeStart = true;
+      continue;
+    }
+
+    llvm_unreachable("unknown deopt value type");
+  }
+  return Changed;
+}
+
+static bool rewriteDeoptBundleDef(OperandBundleDef &OBD, LLVMContext &Ctx,
+                                  LazyObjectLookup Lookup,
+                                  LazyObjectByIDLookup LookupByID,
+                                  DeoptInputNormalizer Normalize) {
+  if (OBD.getTag() != "deopt")
+    return false;
+  SmallVector<Value *, 32> Inputs;
+  bool Changed = buildLazyDeoptInputs(OBD.inputs(), Inputs, Ctx, Lookup,
+                                      LookupByID, Normalize);
+  if (Changed)
+    OBD = OperandBundleDef("deopt", Inputs);
+  return Changed;
+}
+
+static bool appendLazyDeoptBundle(SmallVectorImpl<OperandBundleDef> &Out,
+                                  CallBase *Source, LazyObjectLookup Lookup,
+                                  LazyObjectByIDLookup LookupByID,
+                                  DeoptInputNormalizer Normalize,
+                                  Value *ForbiddenInput = nullptr) {
+  if (!Source)
+    return false;
+  std::optional<OperandBundleUse> Deopt = Source->getOperandBundle("deopt");
+  if (!Deopt)
+    return false;
+
+  SmallVector<Value *, 32> OldInputs;
+  OldInputs.reserve(Deopt->Inputs.size());
+  for (const Use &U : Deopt->Inputs)
+    OldInputs.push_back(U.get());
+
+  SmallVector<Value *, 32> Inputs;
+  (void)buildLazyDeoptInputs(OldInputs, Inputs, Source->getContext(), Lookup,
+                             LookupByID, Normalize);
+  if (ForbiddenInput && llvm::is_contained(Inputs, ForbiddenInput))
+    return false;
+  Out.emplace_back("deopt", Inputs);
+  return true;
+}
+
 // Emit the materialization sequence for a single Materialize effect: split the
 // containing block at the MaterializeEffect's InsertBefore so the new
 // materialization is the terminator, emit a hotspotcc InvokeInst, replay
@@ -213,6 +656,13 @@ static void relocateDependentMaterializes(
   auto &NextBucket = Dependents[Next];
   for (jeandle::MaterializeEffect *M : Bucket) {
     M->setInsertBefore(Next);
+    if (static_cast<Value *>(M->DeoptBundleSource) == Dying) {
+      if (auto *NextCB = dyn_cast<CallBase>(Next);
+          NextCB && NextCB->getOperandBundle("deopt"))
+        M->DeoptBundleSource = NextCB;
+      else
+        M->DeoptBundleSource = nullptr;
+    }
     NextBucket.push_back(M);
   }
 }
@@ -230,7 +680,10 @@ static void applyMaterialize(
         &CascadeKeyOf,
     const DenseMap<Instruction *,
                    SmallVector<const jeandle::MaterializeEffect *, 4>>
-        &CascadeGroups) {
+        &CascadeGroups,
+    DenseMap<Value *, Value *> &ValueReplacements,
+    DenseMap<Value *, LazyDeoptObject> &LazyInfoForDef,
+    DenseMap<CallBase *, SmallVector<LazyDeoptObject, 4>> &LazyInfoForCall) {
   assert(E.ObjID != jeandle::InvalidObjectID);
   assert(E.Target && "Materialize effect must carry the original allocation");
 
@@ -324,18 +777,18 @@ static void applyMaterialize(
   BasicBlock *MatCont = Origin->splitBasicBlock(InsertBefore, "mat.cont");
   Origin->getTerminator()->eraseFromParent();
 
-  // Step 5: collect operand bundles from the recorded source (escape-point
-  // CallBase or original allocation). Drop "deopt": copying it would plant
-  // OrigAlloc into NewInv's own bundle (the source CB's deopt slot for the VO
-  // holds OrigAlloc), which the resolution sub-pass would rewrite to NewInv —
-  // a self-reference the verifier rejects.
-  // TODO(jeandle-deopt): see applyMaterialize().
-  // Preserve every non-deopt bundle (funclet, gc-transition, cfguardtarget,
-  // ptrauth, kcfi, ...). The funclet-bundle synthesis below handles the
-  // Windows-EH case for the materialization site itself.
+  // Step 5: collect operand bundles. Bundles come from the analysis-selected
+  // DeoptBundleSource (escape point / prior deopt anchor / original allocation)
+  // and are copied unchanged except for the deopt bundle, whose slots naming
+  // virtual instance objects are rewritten to LazyObjectType lazy-object
+  // records. That avoids putting OrigAlloc into NewInv's own deopt bundle,
+  // which would otherwise become a self-reference after point-sensitive
+  // materialized-use resolution.
   SmallVector<OperandBundleDef, 4> Bundles;
-  if (E.DeoptBundleSource) {
-    if (auto *CBSrc = dyn_cast<CallBase>(E.DeoptBundleSource)) {
+  CallBase *BundleSource = nullptr;
+  if (Value *DBSV = E.DeoptBundleSource) {
+    if (auto *CBSrc = dyn_cast<CallBase>(DBSV)) {
+      BundleSource = CBSrc;
       SmallVector<OperandBundleDef, 4> All;
       CBSrc->getOperandBundlesAsDefs(All);
       for (OperandBundleDef &OBD : All)
@@ -343,6 +796,51 @@ static void applyMaterialize(
           Bundles.emplace_back(std::move(OBD));
     }
   }
+  CallBase *DeoptSource = BundleSource ? BundleSource : OrigAlloc;
+
+  std::optional<LazyDeoptObject> LazyInfo;
+  if (VObj.isInstance() && VObj.Klass != 0)
+    LazyInfo = buildLazyDeoptObject(VObj, E.FieldEntries, NewAllocFor,
+                                    ValueReplacements);
+  auto Lookup = [&](Value *V) -> const LazyDeoptObject * {
+    if (LazyInfo && V == OrigAlloc)
+      return &*LazyInfo;
+
+    auto CallIt = LazyInfoForCall.find(DeoptSource);
+    if (CallIt != LazyInfoForCall.end()) {
+      for (const LazyDeoptObject &Obj : CallIt->second)
+        if (lazyObjectHasValue(Obj, V))
+          return &Obj;
+    }
+
+    auto DefIt = LazyInfoForDef.find(V);
+    if (DefIt != LazyInfoForDef.end())
+      return &DefIt->second;
+    return nullptr;
+  };
+  auto LookupByID = [&](jeandle::ObjectID ID) -> const LazyDeoptObject * {
+    if (LazyInfo && LazyInfo->ID == ID)
+      return &*LazyInfo;
+
+    auto CallIt = LazyInfoForCall.find(DeoptSource);
+    if (CallIt != LazyInfoForCall.end()) {
+      for (const LazyDeoptObject &Obj : CallIt->second)
+        if (Obj.ID == ID)
+          return &Obj;
+    }
+
+    for (const auto &Kv : LazyInfoForDef)
+      if (Kv.second.ID == ID)
+        return &Kv.second;
+    return nullptr;
+  };
+  auto NormalizeDeoptInput = [&](Value *V) -> Value * {
+    Value *R = resolveValueReplacement(V, ValueReplacements);
+    return R ? R : V;
+  };
+  appendLazyDeoptBundle(Bundles, DeoptSource, Lookup, LookupByID,
+                        NormalizeDeoptInput, OrigAlloc);
+
   // Attach the funclet bundle computed pre-split (Step 3b) when the
   // materialization site sits inside an EH funclet and the recorded source
   // didn't already supply one.
@@ -360,17 +858,15 @@ static void applyMaterialize(
   if (InsertBefore->getDebugLoc())
     B.SetCurrentDebugLocation(InsertBefore->getDebugLoc());
   InvokeInst *NewInv = B.CreateInvoke(AllocFn, /*NormalDest=*/MatCont,
-                                      /*UnwindDest=*/UnwindDest, AllocArgs,
-                                      Bundles, "pea.mat");
+                                      /*UnwindDest=*/UnwindDest,
+                                      AllocArgs, Bundles, "pea.mat");
   NewInv->setCallingConv(CallingConv::Hotspot_JIT);
   // Copy metadata and merge attrs from the original allocation so downstream
   // RewriteStatepointsForGC / GC barriers don't see weaker output (lost
   // !prof, !alias.scope, !noalias, !jeandle.bytecodeindex, nofree/nosync/cold).
-  // Metadata first; addRetAttr below then takes precedence. The re-emitted
-  // invoke is rebuilt from VirtualObject structural fields and matches the
-  // allocation function's full arity, so the per-param argument attrs in
-  // OrigAttrs align one-to-one and are safe to reuse; return attrs are added
-  // explicitly below.
+  // Metadata first; addRetAttr below then takes precedence. Argument attrs are
+  // safe to reuse because the invoke has the same {Arg0, Arg1} signature as a
+  // frontend allocation site; return attrs are added explicitly below.
   NewInv->copyMetadata(*OrigAlloc, /*WL=*/{});
   AttributeList OrigAttrs = OrigAlloc->getAttributes();
   AttributeList CurAttrs = NewInv->getAttributes();
@@ -418,9 +914,9 @@ static void applyMaterialize(
              "tail emits its field stores");
       for (const auto &FE : M->FieldEntries) {
         Value *V = nullptr;
-        if (FE.Value.isScalar()) {
-          V = FE.Value.getScalar();
-        } else if (FE.Value.isMaterializedRef()) {
+        if (FE.isScalar()) {
+          V = FE.getScalar();
+        } else if (FE.isMaterializedRef()) {
           // Field value is an inner/peer virtual's OrigAlloc (the analyzer
           // records OrigAlloc on both the live and per-pred paths). Emit it
           // here; the point-sensitive resolution sub-pass
@@ -430,7 +926,7 @@ static void applyMaterialize(
           // because the store sits in the cascade tail, dominated by every
           // peer NewInv. Eager substitution via NewAllocFor would be
           // last-write-wins and miscompile multi-materialization cases.
-          V = FE.Value.getMaterialized();
+          V = FE.getMaterialized();
         } else {
           // The analyzer rewrites every VirtualRef into MaterializedRef during
           // recursive prerequisite materialization. Unknown entries are
@@ -440,6 +936,7 @@ static void applyMaterialize(
                           "to MaterializedRef during analysis");
           continue;
         }
+        V = resolveValueReplacement(V, ValueReplacements);
         if (!V)
           continue;
         Value *Slot = SB.CreateInBoundsGEP(I8, Base, SB.getInt64(FE.Offset),
@@ -485,13 +982,19 @@ static void applyMaterialize(
   // NewInv. If the escape-point key is unresolved (the escape call was erased
   // by a sibling effect), fall back to this effect's own locks.
   auto EmitLock = [&](Value *Recv, Function *Callee,
-                      ArrayRef<Value *> NonReceiverArgs) {
+                      ArrayRef<WeakTrackingVH> NonReceiverArgs) {
     if (!Callee)
       return;
     SmallVector<Value *, 4> Args;
     Args.push_back(Recv);
-    for (Value *A : NonReceiverArgs)
+    for (const WeakTrackingVH &VH : NonReceiverArgs) {
+      Value *A = resolveValueReplacement(static_cast<Value *>(VH),
+                                         ValueReplacements);
+      assert(A && "materialized lock argument was deleted without replacement");
+      if (!A)
+        return;
       Args.push_back(A);
+    }
     CallInst *Enter = SB.CreateCall(Callee, Args);
     Enter->setCallingConv(CallingConv::Hotspot_JIT);
   };
@@ -540,6 +1043,9 @@ static void applyMaterialize(
       EmitLock(NewInv, ML.Callee, ML.NonReceiverArgs);
   }
 
+  if (LazyInfo)
+    LazyInfoForDef[NewInv] = *LazyInfo;
+
   // Record this materialization in NewAllocFor so any later applyMaterialize
   // can rewrite a recorded MaterializedRef referencing OrigAlloc to the live
   // NewInv (field-store replay of a nested virtual).
@@ -567,9 +1073,8 @@ static void applyMaterialize(
   // rewrites each surviving OrigAlloc use to the unique dominating def (this
   // NewInv, a sibling per-pred NewInv, or a merge PHI). This mirrors Graal's
   // per-point alias resolution (getAlias/getAliasAndResolve) and is what makes
-  // escape-point (non-dominating) materialization SSA-sound. Deopt-bundle
-  // operands are scrubbed to a typed null in the sub-pass (PEA stays
-  // deopt-agnostic; see resolveMaterializedUses).
+  // escape-point (non-dominating) materialization SSA-sound, including uses in
+  // deopt bundles that are dominated by the materialized value.
   Defs[OrigAlloc].push_back(NewInv);
 }
 
@@ -585,6 +1090,9 @@ struct jeandle::TransformContext {
   DenseMap<std::pair<BasicBlock *, Value *>, Value *> &MatPerBlock;
   DenseMap<std::pair<BasicBlock *, BasicBlock *>, BasicBlock *> &BlockRename;
   DenseMap<Value *, SmallVector<Value *, 4>> &Defs;
+  DenseMap<Value *, Value *> &ValueReplacements;
+  DenseMap<Value *, LazyDeoptObject> &LazyInfoForDef;
+  DenseMap<CallBase *, SmallVector<LazyDeoptObject, 4>> &LazyInfoForCall;
   bool &Changed;
 
   // Cascade coordination for cyclic-field materialization (Graal's single
@@ -691,6 +1199,7 @@ void jeandle::ReplaceLoadEffect::apply(jeandle::TransformContext &Ctx) {
         I->insertBefore(Target->getIterator());
     }
   }
+  Ctx.ValueReplacements[Target] = Repl;
   if (!Target->use_empty())
     Target->replaceAllUsesWith(Repl);
   // Re-aim any Materialize keyed on `Target` to its next instruction before
@@ -710,6 +1219,7 @@ void jeandle::ReplaceCallEffect::apply(jeandle::TransformContext &Ctx) {
   if (!Target)
     return;
   if (Replacement) {
+    Ctx.ValueReplacements[Target] = Replacement;
     Target->replaceAllUsesWith(Replacement);
   } else if (!Target->use_empty()) {
     return;
@@ -757,8 +1267,31 @@ void jeandle::EliminateStoreEffect::apply(jeandle::TransformContext &Ctx) {
 }
 
 void jeandle::EliminateAllocationEffect::apply(jeandle::TransformContext &Ctx) {
-  if (eraseAllocation(Target))
+  if (eraseAllocation(getTarget()))
     Ctx.Changed = true;
+}
+
+void jeandle::RecordDeoptStateEffect::apply(jeandle::TransformContext &Ctx) {
+  auto *CB = dyn_cast_or_null<CallBase>(Target);
+  if (!CB || !CB->getParent() || Snapshot.ID == jeandle::InvalidObjectID)
+    return;
+  if (Snapshot.ID >= Ctx.Result.VirtualObjects.size())
+    return;
+
+  jeandle::VirtualObject &VObj = *Ctx.Result.VirtualObjects[Snapshot.ID];
+  if (!VObj.isInstance() || VObj.Klass == 0)
+    return;
+
+  LazyDeoptObject Obj =
+      buildLazyDeoptObject(Ctx.Result, VObj, Snapshot.FieldEntries,
+                           Ctx.NewAllocFor, Ctx.ValueReplacements);
+  for (const WeakTrackingVH &VH : Snapshot.Values) {
+    Value *V = resolveValueReplacement(static_cast<Value *>(VH),
+                                       Ctx.ValueReplacements);
+    if (V)
+      Obj.Values.emplace_back(V);
+  }
+  Ctx.LazyInfoForCall[CB].push_back(Obj);
 }
 
 void jeandle::MaterializeEffect::apply(jeandle::TransformContext &Ctx) {
@@ -768,7 +1301,9 @@ void jeandle::MaterializeEffect::apply(jeandle::TransformContext &Ctx) {
   // The cascade maps drive the two-phase field-store replay (cyclic fields).
   applyMaterialize(Ctx.F, Ctx.Result, *this, Ctx.NewAllocFor, Ctx.MatPerBlock,
                    Ctx.BlockRename, Ctx.Defs, Ctx.NewInvOf, Ctx.IsCascadeTail,
-                   Ctx.CascadeKeyOf, Ctx.CascadeGroups);
+                   Ctx.CascadeKeyOf, Ctx.CascadeGroups,
+                   Ctx.ValueReplacements, Ctx.LazyInfoForDef,
+                   Ctx.LazyInfoForCall);
   Ctx.Changed = true;
 }
 
@@ -777,7 +1312,9 @@ void jeandle::CreatePHIEffect::apply(jeandle::TransformContext &Ctx) {
   // block (after any existing PHIs), and wire up its incoming values. For each
   // incoming (V, Pred): walk BlockRename to the live merge-pred; if V refers to
   // an OrigAlloc materialized at this (Pred, V), use the per-pred NewInv from
-  // MatPerBlock, else fall back to NewAllocFor.
+  // MatPerBlock. Field/value PHIs may also fall back to NewAllocFor; object
+  // identity PHIs deliberately keep OrigAlloc when there is no exact per-pred
+  // hit so resolveMaterializedUses can pick the dominating def for that edge.
   PHINode *Phi = PhiInst;
   assert(Phi && "CreatePHI effect requires a PhiInst");
   assert(Phi->getParent() == nullptr &&
@@ -786,13 +1323,24 @@ void jeandle::CreatePHIEffect::apply(jeandle::TransformContext &Ctx) {
   Phi->insertBefore(MergeBB->getFirstInsertionPt());
   assert(PHIIncomingValues.size() == PHIIncomingBlocks.size());
   for (unsigned I = 0; I < PHIIncomingValues.size(); ++I) {
-    Value *V = PHIIncomingValues[I];
+    Value *V = resolveValueReplacement(static_cast<Value *>(PHIIncomingValues[I]),
+                                       Ctx.ValueReplacements);
+    if (!V) {
+      assert(false && "CreatePHI incoming was deleted without replacement");
+      V = PoisonValue::get(PHIType ? PHIType : Phi->getType());
+    }
     BasicBlock *Pred = PHIIncomingBlocks[I];
+    auto OrigAllocForObj = [&]() -> Value * {
+      if (ObjID == jeandle::InvalidObjectID)
+        return nullptr;
+      jeandle::VirtualObject &VObj = *Ctx.Result.VirtualObjects[ObjID];
+      return VObj.AllocationCall;
+    };
     if (auto *VI = dyn_cast<Instruction>(V)) {
       auto It = Ctx.MatPerBlock.find({Pred, VI});
       if (It != Ctx.MatPerBlock.end()) {
         V = It->second;
-      } else {
+      } else if (!RAUWOrigToPHI) {
         auto It2 = Ctx.NewAllocFor.find(VI);
         if (It2 != Ctx.NewAllocFor.end())
           V = It2->second;
@@ -808,15 +1356,37 @@ void jeandle::CreatePHIEffect::apply(jeandle::TransformContext &Ctx) {
     // resolveMaterializedUses — keeps the PHI alive). Detect the placeholder
     // precisely via the analyzer's placeholder set (NOT by "unparented
     // PHINode": a loop field-PHI incoming can also be momentarily unparented
-    // and must be left as-is), then fall back to the global materialization,
-    // which exists precisely because the object is materialized; otherwise the
-    // original allocation (valid IR that the resolution sub-pass / Pass 2 then
-    // handles).
+    // and must be left as-is). Object identity PHIs fall back to OrigAlloc so
+    // point-sensitive resolution chooses the dominating def per incoming edge;
+    // field/value PHIs can use the global materialization when present.
     if (Ctx.Result.PerPredMatPlaceholders.count(V) &&
         ObjID != jeandle::InvalidObjectID) {
-      Value *OrigAlloc = Ctx.Result.VirtualObjects[ObjID]->AllocationCall;
-      auto ItG = Ctx.NewAllocFor.find(OrigAlloc);
-      V = (ItG != Ctx.NewAllocFor.end()) ? ItG->second : OrigAlloc;
+      Value *OrigAlloc = OrigAllocForObj();
+      if (RAUWOrigToPHI) {
+        V = OrigAlloc;
+      } else {
+        auto ItG = Ctx.NewAllocFor.find(OrigAlloc);
+        V = (ItG != Ctx.NewAllocFor.end()) ? ItG->second : OrigAlloc;
+      }
+    }
+    // Materialized-object PHIs must not take analyzer-owned, unparented PHI
+    // shells as real incoming values. Those shells may survive loop rollback in
+    // block state to keep the analysis fixpoint stable, but only their own
+    // CreatePHI effect may parent them into IR. For object identity merges,
+    // keep the legal OrigAlloc use and let resolveMaterializedUses select the
+    // closest dominating materialization/PHI for this incoming edge. Field PHIs
+    // intentionally keep the legacy behavior: their unparented loop-field
+    // incoming may still be inserted by a separate CreatePHI effect.
+    if (RAUWOrigToPHI) {
+      if (auto *VI = dyn_cast<Instruction>(V)) {
+        if (VI != Phi && !VI->getParent()) {
+          Value *OrigAlloc = OrigAllocForObj();
+          assert(OrigAlloc &&
+                 "materialized-object PHI requires a virtual object alloc");
+          if (OrigAlloc)
+            V = OrigAlloc;
+        }
+      }
     }
     // Resolve the live pred BB through BlockRename. Keyed by (LivePred,
     // this->Block) — CreatePHI is always per-pred, so this->Block IS the target
@@ -945,6 +1515,156 @@ static bool isCloserDominatingDef(Value *Candidate, Value *Current,
   return DT.dominates(Current, CandidateI);
 }
 
+static Value *findClosestDominatingDef(
+    Value *V, Instruction *At,
+    DenseMap<Value *, SmallVector<Value *, 4>> &Defs,
+    const DominatorTree &DT) {
+  auto DefIt = Defs.find(V);
+  if (DefIt == Defs.end())
+    return nullptr;
+  Value *Dom = nullptr;
+  for (Value *Def : DefIt->second) {
+    if (!DT.dominates(Def, At))
+      continue;
+    if (isCloserDominatingDef(Def, Dom, DT))
+      Dom = Def;
+  }
+  return Dom;
+}
+
+static Value *resolveDeoptInputValue(
+    Value *V, Instruction *At, const DominatorTree &DT,
+    DenseMap<Value *, SmallVector<Value *, 4>> &Defs,
+    const DenseMap<Value *, Value *> &ValueReplacements) {
+  Value *Resolved = resolveValueReplacement(V, ValueReplacements);
+  if (!Resolved)
+    return V;
+  if (Value *Dom = findClosestDominatingDef(Resolved, At, Defs, DT))
+    return Dom;
+  return Resolved;
+}
+
+static bool rewriteDeoptBundlesWithLazyObjects(
+    Function &F, DenseMap<Value *, SmallVector<Value *, 4>> &Defs,
+    DenseMap<Value *, LazyDeoptObject> &LazyInfoForDef,
+    DenseMap<CallBase *, SmallVector<LazyDeoptObject, 4>> &LazyInfoForCall,
+    const DenseSet<CallBase *> &ProtectedAllocations,
+    const DenseMap<Value *, Value *> &ValueReplacements) {
+  DominatorTree DT(F);
+  SmallVector<CallBase *, 16> Calls;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB)
+      if (auto *CB = dyn_cast<CallBase>(&I))
+        if (CB->getOperandBundle("deopt"))
+          Calls.push_back(CB);
+
+  bool Changed = false;
+  for (CallBase *CB : Calls) {
+    if (!CB->getParent())
+      continue;
+    // PEA-owned allocation calls are named by later effects or by Defs used for
+    // point-sensitive alias resolution. Rebuilding those calls here would leave
+    // stale instruction pointers behind. Ordinary surviving allocations are safe
+    // to clone when only their deopt bundle needs canonicalization.
+    if (jeandle::pea::isJeandleAllocation(CB) &&
+        ProtectedAllocations.contains(CB))
+      continue;
+
+    auto Lookup = [&](Value *V) -> const LazyDeoptObject * {
+      auto MatchCallSnapshot = [&](Value *Needle) -> const LazyDeoptObject * {
+        auto CallIt = LazyInfoForCall.find(CB);
+        if (CallIt == LazyInfoForCall.end())
+          return nullptr;
+        for (const LazyDeoptObject &Obj : CallIt->second)
+          if (lazyObjectHasValue(Obj, Needle))
+            return &Obj;
+        return nullptr;
+      };
+
+      if (const LazyDeoptObject *Obj = MatchCallSnapshot(V))
+        return Obj;
+
+      Value *Resolved = resolveValueReplacement(V, ValueReplacements);
+      if (!Resolved)
+        Resolved = V;
+      if (Resolved != V)
+        if (const LazyDeoptObject *Obj = MatchCallSnapshot(Resolved))
+          return Obj;
+
+      if (Value *Dom = findClosestDominatingDef(Resolved, CB, Defs, DT)) {
+        auto LazyIt = LazyInfoForDef.find(Dom);
+        if (LazyIt != LazyInfoForDef.end())
+          return &LazyIt->second;
+      }
+
+      if (auto It = LazyInfoForDef.find(Resolved);
+          It != LazyInfoForDef.end()) {
+        if (!DT.dominates(Resolved, CB))
+          return nullptr;
+        return &It->second;
+      }
+      return nullptr;
+    };
+    auto LookupByID = [&](jeandle::ObjectID ID) -> const LazyDeoptObject * {
+      auto CallIt = LazyInfoForCall.find(CB);
+      if (CallIt != LazyInfoForCall.end()) {
+        for (const LazyDeoptObject &Obj : CallIt->second)
+          if (Obj.ID == ID)
+            return &Obj;
+      }
+
+      Value *Dom = nullptr;
+      const LazyDeoptObject *Best = nullptr;
+      for (const auto &Kv : LazyInfoForDef) {
+        if (Kv.second.ID != ID)
+          continue;
+        auto *DI = dyn_cast<Instruction>(Kv.first);
+        if (!DI || !DT.dominates(Kv.first, CB))
+          continue;
+        if (isCloserDominatingDef(Kv.first, Dom, DT)) {
+          Dom = Kv.first;
+          Best = &Kv.second;
+        }
+      }
+      return Best;
+    };
+
+    auto NormalizeDeoptInput = [&](Value *V) -> Value * {
+      return resolveDeoptInputValue(V, CB, DT, Defs, ValueReplacements);
+    };
+
+    SmallVector<OperandBundleDef, 4> Bundles;
+    CB->getOperandBundlesAsDefs(Bundles);
+    bool CBChanged = false;
+    for (OperandBundleDef &OBD : Bundles)
+      CBChanged |= rewriteDeoptBundleDef(OBD, F.getContext(), Lookup,
+                                         LookupByID, NormalizeDeoptInput);
+    if (!CBChanged)
+      continue;
+
+    CallBase *NewCB = CallBase::Create(CB, Bundles, CB->getIterator());
+    NewCB->copyMetadata(*CB, /*WL=*/{});
+    auto LazySelf = LazyInfoForDef.find(CB);
+    if (LazySelf != LazyInfoForDef.end()) {
+      LazyDeoptObject Saved = LazySelf->second;
+      LazyInfoForDef.erase(LazySelf);
+      LazyInfoForDef[NewCB] = Saved;
+    }
+    auto LazyCall = LazyInfoForCall.find(CB);
+    if (LazyCall != LazyInfoForCall.end()) {
+      SmallVector<LazyDeoptObject, 4> Saved;
+      Saved.assign(LazyCall->second.begin(), LazyCall->second.end());
+      LazyInfoForCall.erase(LazyCall);
+      LazyInfoForCall[NewCB] = Saved;
+    }
+    if (!CB->use_empty())
+      CB->replaceAllUsesWith(NewCB);
+    CB->eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
+}
+
 // Point-sensitive resolution of original-allocation uses — Jeandle's analog of
 // Graal's per-point alias resolution (the `aliases` map / getAlias /
 // getAliasAndResolve, which Graal maintains because it REPLACES the allocation
@@ -960,11 +1680,11 @@ static bool isCloserDominatingDef(Value *Candidate, Value *Current,
 // Defs[OrigAlloc] that dominates it. Normally only one def dominates a use, but
 // a later materialization or merge PHI may shadow an earlier dominating def; in
 // that case the deeper/later def is the SSA value that represents this point.
-// Deopt-bundle operands are scrubbed to a typed null (PEA stays
-// deopt-agnostic).
-static void
-resolveMaterializedUses(Function &F,
-                        DenseMap<Value *, SmallVector<Value *, 4>> &Defs) {
+// Deopt-bundle operands participate in the same resolution: modeled
+// virtual objects are rewritten to lazy-object records before ordinary use
+// resolution, and materialized aliases are updated to the dominating def.
+static void resolveMaterializedUses(
+    Function &F, DenseMap<Value *, SmallVector<Value *, 4>> &Defs) {
   if (Defs.empty())
     return;
   DominatorTree DT(F);
@@ -974,8 +1694,6 @@ resolveMaterializedUses(Function &F,
     const SmallVector<Value *, 4> &DefList = Kv.second;
     if (OrigAlloc->use_empty())
       continue;
-    Value *NullVO =
-        ConstantPointerNull::get(cast<PointerType>(OrigAlloc->getType()));
     for (Use &U : llvm::make_early_inc_range(OrigAlloc->uses())) {
       // Pick the NEAREST (deepest) dominating definition, not merely the first
       // in DefList order. DefList insertion order = Pass-1 RPO apply order, so
@@ -1004,16 +1722,6 @@ resolveMaterializedUses(Function &F,
       }
       if (!Dom)
         continue; // no dominating def; leave for Pass 2's poison RAUW.
-      // Scrub deopt-bundle operands to a typed null rather than threading a
-      // (possibly non-dominating) NewInv/PHI into a sibling's deopt bundle.
-      if (auto *CB = dyn_cast<CallBase>(U.getUser())) {
-        unsigned OpIdx = U.getOperandNo();
-        if (CB->isBundleOperand(OpIdx) &&
-            CB->getOperandBundleForOperand(OpIdx).isDeoptOperandBundle()) {
-          U.set(NullVO);
-          continue;
-        }
-      }
       U.set(Dom);
     }
   }
@@ -1034,6 +1742,17 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
     return PreservedAnalyses::all();
 
   bool Changed = false;
+
+  DenseSet<CallBase *> ProtectedAllocations;
+  for (const auto &Kv : Result.BlockEffects) {
+    for (const auto &E : Kv.second) {
+      if (!isa<jeandle::MaterializeEffect>(&E) &&
+          !isa<jeandle::EliminateAllocationEffect>(&E))
+        continue;
+      if (auto *CB = dyn_cast_or_null<CallBase>(E.getTarget()))
+        ProtectedAllocations.insert(CB);
+    }
+  }
 
   // Map from each virtual object's original allocation to the new
   // materialized invoke produced by applyMaterialize. Populated in SeqNo
@@ -1057,6 +1776,13 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
   // PHI) populated during Pass 1. Consumed by resolveMaterializedUses after
   // Pass 1 to rewrite each surviving OrigAlloc use to its dominating def.
   DenseMap<Value *, SmallVector<Value *, 4>> Defs;
+  // Per-materialized definition lazy-object snapshots used to rewrite deopt
+  // bundles before ordinary OrigAlloc uses are resolved.
+  DenseMap<Value *, LazyDeoptObject> LazyInfoForDef;
+  // Per-call lazy-object snapshots captured from that call's original deopt
+  // bundle by the analysis pass.
+  DenseMap<CallBase *, SmallVector<LazyDeoptObject, 4>> LazyInfoForCall;
+  DenseMap<Value *, Value *> ValueReplacements;
 
   // -------------------------------------------------------------------------
   // PRE-PASS: split critical edges before per-pred materialisation.
@@ -1238,6 +1964,9 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
                                 MatPerBlock,
                                 BlockRename,
                                 Defs,
+                                ValueReplacements,
+                                LazyInfoForDef,
+                                LazyInfoForCall,
                                 Changed,
                                 CascadeGroups,
                                 CascadeKeyOf,
@@ -1258,6 +1987,24 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
   // alias resolution). Runs after Pass 1 has settled the CFG; before Pass 2 so
   // the allocation becomes use-empty before EliminateAllocation erases it.
   // -------------------------------------------------------------------------
+  if (!Defs.empty()) {
+    for (const auto &Kv : Defs) {
+      if (auto *CB = dyn_cast<CallBase>(Kv.first))
+        ProtectedAllocations.insert(CB);
+      for (Value *Def : Kv.second)
+        if (auto *CB = dyn_cast<CallBase>(Def))
+          ProtectedAllocations.insert(CB);
+    }
+  }
+
+  if (!LazyInfoForCall.empty() || !LazyInfoForDef.empty() || !Defs.empty()) {
+    if (rewriteDeoptBundlesWithLazyObjects(F, Defs, LazyInfoForDef,
+                                           LazyInfoForCall,
+                                           ProtectedAllocations,
+                                           ValueReplacements))
+      Changed = true;
+  }
+
   if (!Defs.empty()) {
     resolveMaterializedUses(F, Defs);
     Changed = true;

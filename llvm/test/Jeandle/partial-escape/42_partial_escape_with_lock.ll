@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; PEA: diamond CFG. The escape branch acquires the lock and passes the
 ; virtual to an opaque sink (escape with lock held); the hot branch acquires
@@ -13,6 +13,8 @@ declare hotspotcc void @jeandle.monitorexit_with_thin_lock(ptr addrspace(1), ptr
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
+declare hotspotcc void @jeandle.safepoint_poll()
+
 define void @test_partial_escape_with_lock(i1 %c) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
   %lock = alloca i64, align 8
@@ -20,14 +22,16 @@ entry:
             ptr inttoptr (i64 12345 to ptr), i32 16)
        to label %n unwind label %u
 n:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br i1 %c, label %escape, label %hot
 
 escape:
   call hotspotcc void @jeandle.monitorenter_with_thin_lock(
                   ptr addrspace(1) %o, ptr %lock)
-  call void @sink(ptr addrspace(1) %o)
+  call void @sink(ptr addrspace(1) %o) [ "deopt"(i32 0, i32 0) ]
   call hotspotcc void @jeandle.monitorexit_with_thin_lock(
                   ptr addrspace(1) %o, ptr %lock)
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %merge
 
 hot:
@@ -35,9 +39,11 @@ hot:
                   ptr addrspace(1) %o, ptr %lock)
   call hotspotcc void @jeandle.monitorexit_with_thin_lock(
                   ptr addrspace(1) %o, ptr %lock)
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %merge
 
 merge:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   ret void
 
 u:

@@ -1,4 +1,4 @@
-//===- JeandleUtils.hpp - Jeandle common utility definitions --------------===//
+//===- JeandleUtils.h - Jeandle common utility definitions --------------===//
 //
 // Copyright (c) 2026, the Jeandle-LLVM Authors. All Rights Reserved.
 //
@@ -8,8 +8,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef JEANDLE_UTILS_HPP
-#define JEANDLE_UTILS_HPP
+#ifndef JEANDLE_UTILS_H
+#define JEANDLE_UTILS_H
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -20,8 +20,8 @@
 
 namespace llvm::jeandle {
 
-/// Basic types used by HotSpot JVM, mirroring HotSpot's BasicType enum.
-/// The numeric values must match the HotSpot definitions exactly.
+/// Basic types used by HotSpot JVM. Numeric values must match HotSpot's
+/// BasicType enum because they are serialized into deoptimization records.
 enum HotspotBasicType {
   T_BOOLEAN = 4,
   T_CHAR = 5,
@@ -33,7 +33,17 @@ enum HotspotBasicType {
   T_LONG = 11,
   T_OBJECT = 12,
   T_ARRAY = 13,
+  T_VOID = 14,
+  T_ADDRESS = 15,
+  T_METADATA = 17,
+  T_CONFLICT = 19,
+  T_ILLEGAL = 99,
 };
+
+inline constexpr bool isValidHotspotBasicType(int BasicType) {
+  return (BasicType >= T_BOOLEAN && BasicType <= T_CONFLICT) ||
+         BasicType == T_ILLEGAL;
+}
 
 /// Returns true if \p Ty is a pointer in the Java heap address space,
 /// i.e., it represents a uncompressed Java object reference (oop).
@@ -94,4 +104,4 @@ inline std::optional<int> getOopHandleId(Value *V) {
 
 } // namespace llvm::jeandle
 
-#endif // JEANDLE_UTILS_HPP
+#endif // JEANDLE_UTILS_H

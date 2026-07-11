@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; (§8.1.13): Cyclic nested virtuals. Two virtuals A and B form a cycle —
 ; A.f = B and B.g = A. Returning A escapes A; transitive materialization must
@@ -10,6 +10,8 @@
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare i32 @__gxx_personality_v0(...)
+
+declare hotspotcc void @jeandle.safepoint_poll()
 
 define ptr addrspace(1) @test_cyclic_nested() gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
@@ -25,6 +27,7 @@ nB:
   store atomic ptr addrspace(1) %b, ptr addrspace(1) %slotA unordered, align 8
   %slotB = getelementptr inbounds i8, ptr addrspace(1) %b, i64 8
   store atomic ptr addrspace(1) %a, ptr addrspace(1) %slotB unordered, align 8
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   ret ptr addrspace(1) %a
 u1:
   %lp1 = landingpad i64 cleanup

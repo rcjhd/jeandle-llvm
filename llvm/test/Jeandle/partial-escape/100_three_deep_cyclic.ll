@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; Edge case: three-deep cyclic nested virtuals. A.x=B, B.x=C, C.x=A.
 ; Only A escapes (returned). Transitive materialization should produce all
@@ -7,6 +7,8 @@
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare i32 @__gxx_personality_v0(...)
+
+declare hotspotcc void @jeandle.safepoint_poll()
 
 define ptr addrspace(1) @test_three_deep_cyclic() gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
@@ -28,6 +30,7 @@ nC:
   store atomic ptr addrspace(1) %c, ptr addrspace(1) %slotB unordered, align 8
   %slotC = getelementptr inbounds i8, ptr addrspace(1) %c, i64 8
   store atomic ptr addrspace(1) %a, ptr addrspace(1) %slotC unordered, align 8
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   ret ptr addrspace(1) %a
 u1:
   %lp1 = landingpad i64 cleanup

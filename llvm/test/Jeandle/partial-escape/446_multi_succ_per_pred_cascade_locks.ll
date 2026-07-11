@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; Multi-successor per-pred cascade with merged lock re-emit (review §1.2 F2).
 ;
@@ -22,6 +22,8 @@ declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
+declare hotspotcc void @jeandle.safepoint_poll()
+
 define void @test_multi_succ_per_pred_cascade_locks(i1 %c, i1 %c2, i1 %c3)
     gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
@@ -38,10 +40,12 @@ fld:
   ; a.f = b: materializing a per-pred cascades b (forward prereq).
   %af = getelementptr inbounds i8, ptr addrspace(1) %a, i64 0
   store atomic ptr addrspace(1) %b, ptr addrspace(1) %af unordered, align 8
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br i1 %c, label %left, label %right
 left:
   ; No locks; branches to BOTH merges so each merge is mixed (left virtual,
   ; right locked).
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br i1 %c3, label %merge1, label %merge2
 right:
   ; Unbalanced enters on a (depth 0) and b (depth 1); two successors.
@@ -49,14 +53,17 @@ right:
       ptr addrspace(1) %a, ptr %la)
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
       ptr addrspace(1) %b, ptr %lb)
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br i1 %c2, label %merge1, label %merge2
 merge1:
-  call void @sink(ptr addrspace(1) %a)
-  call void @sink(ptr addrspace(1) %b)
+  call void @sink(ptr addrspace(1) %a) [ "deopt"(i32 0, i32 0) ]
+  call void @sink(ptr addrspace(1) %b) [ "deopt"(i32 0, i32 0) ]
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   ret void
 merge2:
-  call void @sink(ptr addrspace(1) %a)
-  call void @sink(ptr addrspace(1) %b)
+  call void @sink(ptr addrspace(1) %a) [ "deopt"(i32 0, i32 0) ]
+  call void @sink(ptr addrspace(1) %b) [ "deopt"(i32 0, i32 0) ]
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   ret void
 u:
   %lp = landingpad i64 cleanup

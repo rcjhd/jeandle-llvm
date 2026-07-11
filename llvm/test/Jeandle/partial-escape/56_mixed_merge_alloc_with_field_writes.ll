@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; PEA A3 (Mixed-merge alloc-dominates fast path) with field stores in the
 ; if-then arm. The alloc is in %entry; the if-then arm writes a field then
@@ -10,6 +10,8 @@ declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
+declare hotspotcc void @jeandle.safepoint_poll()
+
 define ptr addrspace(1) @test_mixed_merge_with_field_writes(i1 %c, i32 %v)
     gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
@@ -17,15 +19,19 @@ entry:
             ptr inttoptr (i64 12345 to ptr), i32 16)
        to label %n unwind label %u
 n:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br i1 %c, label %then, label %else
 then:
   %slot = getelementptr inbounds i8, ptr addrspace(1) %o, i64 8
   store atomic i32 %v, ptr addrspace(1) %slot unordered, align 4
-  call void @sink(ptr addrspace(1) %o)
+  call void @sink(ptr addrspace(1) %o) [ "deopt"(i32 0, i32 0) ]
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %merge
 else:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %merge
 merge:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   ret ptr addrspace(1) %o
 u:
   %lp = landingpad i64 cleanup

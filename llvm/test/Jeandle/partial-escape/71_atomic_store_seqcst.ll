@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; (§8.1.15 atomics): a virtual receives a `store atomic seq_cst` on its
 ; field, then escapes via @sink. The materialization must replay the field
@@ -18,7 +18,7 @@ entry:
 n:
   %s = getelementptr inbounds i8, ptr addrspace(1) %o, i64 8
   store atomic i32 99, ptr addrspace(1) %s seq_cst, align 4
-  call void @sink(ptr addrspace(1) %o)
+  call void @sink(ptr addrspace(1) %o) [ "deopt"(i32 0, i32 0) ]
   ret void
 u:
   %lp = landingpad i64 cleanup

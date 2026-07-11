@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; Cyclic field graph (A.f = B, B.g = A) combined with an unbalanced
 ; monitorenter on A. Returning A escapes the whole cascade; both objects
@@ -11,6 +11,8 @@
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)
 declare i32 @__gxx_personality_v0(...)
+
+declare hotspotcc void @jeandle.safepoint_poll()
 
 define ptr addrspace(1) @cyclic_with_locks_cascade()
     gc "hotspotgc" personality ptr @__gxx_personality_v0 {
@@ -25,6 +27,7 @@ nb:
   %sb = getelementptr inbounds i8, ptr addrspace(1) %b, i64 8
   store atomic ptr addrspace(1) %a, ptr addrspace(1) %sb unordered, align 8
   call hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %a, ptr %lk1)
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   ret ptr addrspace(1) %a
 u:
   %lp = landingpad i64 cleanup

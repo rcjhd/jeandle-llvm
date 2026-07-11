@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -jeandle-pea-enable-allocation-sinking -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; PEA A3 invariant pin: documents that the "alloc doesn't dominate merge"
 ; subcase of mergeStates' true-mixed branch is unreachable for non-synthetic
@@ -26,9 +26,12 @@ declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
+declare hotspotcc void @jeandle.safepoint_poll()
+
 define ptr addrspace(1) @test_a3_invariant_pin(i1 %c0, i1 %c1)
     gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %n
 n:
   ; Alloc here dominates the merge below by SSA.
@@ -36,22 +39,29 @@ n:
             ptr inttoptr (i64 12345 to ptr), i32 16)
        to label %inner_if unwind label %u
 inner_if:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br i1 %c0, label %t1, label %e1
 t1:
-  call void @sink(ptr addrspace(1) %o)
+  call void @sink(ptr addrspace(1) %o) [ "deopt"(i32 0, i32 0) ]
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %m1
 e1:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %m1
 m1:
   ; m1's preds (t1, e1) both have %o tracked: t1 has Mat, e1 has Virtual.
   ; True-mixed branch fires. Alloc %o is in %n, which dominates %m1.
   ; The assertion in mergeStates passes.
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br i1 %c1, label %t2, label %e2
 t2:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %m2
 e2:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   br label %m2
 m2:
+  call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 0, i32 0) ]
   ret ptr addrspace(1) %o
 u:
   %lp = landingpad i64 cleanup
