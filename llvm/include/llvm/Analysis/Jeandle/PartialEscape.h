@@ -607,8 +607,10 @@ public:
   }
 };
 
-// Emit a real allocation invoke before an escape point, replay tracked field
-// stores, and re-emit surviving monitorenters. Non-cfgKill (Pass 1).
+// Materialize before an escape point by either emitting a replacement
+// allocation or committing virtual state to the surviving original allocation.
+// Replays tracked field stores and surviving monitorenters. Non-cfgKill
+// (Pass 1).
 // Graal analog: the one `Effect("materializeBefore")` appended by
 // PartialEscapeBlockState.materializeBefore.
 class MaterializeEffect : public Effect {
@@ -668,6 +670,8 @@ public:
   // invoke. Kept as a tracking handle because the transform may erase a folded
   // JavaOp before this MaterializeEffect is applied.
   WeakTrackingVH DeoptBundleSource;
+  // Commit the virtual state into the surviving original allocation.
+  bool CommitToOriginalAllocation = false;
   bool IsPerPred = false;
   Value *PerPredPlaceholder = nullptr;
   // The target merge block this per-pred materialize is destined for (the merge

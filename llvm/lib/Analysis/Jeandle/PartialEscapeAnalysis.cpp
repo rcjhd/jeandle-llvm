@@ -1081,6 +1081,7 @@ private:
 
   void validateAllocationEliminationPlans();
   void commit();
+  void keepOriginalAllocation(jeandle::ObjectID ID);
   void dropEffectsFor(jeandle::ObjectID ID);
 
   // Mark a VO ineligible, taking the TRANSITIVE closure over synthetic Case-C
@@ -5145,10 +5146,6 @@ void Analyzer::materializeAt(jeandle::ObjectID ID, Instruction *InsertBefore,
 
   std::optional<DeoptMaterializeAnchor> Anchor =
       findDeoptMaterializeAnchor(InsertBefore);
-  if (!Anchor) {
-    markIneligible(ID);
-    return;
-  }
 
   auto ClearLockState = [&](jeandle::ObjectID Oid) {
     LockCounts[Oid] = 0;
@@ -5171,10 +5168,15 @@ void Analyzer::materializeAt(jeandle::ObjectID ID, Instruction *InsertBefore,
   auto ComputeSafeIP = [&]() -> Instruction * {
     // The default mode reaches only the escaping instruction; the option may
     // select the nearest safe prior deopt point.
-    return Anchor->InsertBefore;
+    return Anchor ? Anchor->InsertBefore : InsertBefore;
   };
   auto SetEffectFlags = [&](jeandle::MaterializeEffect &E, Instruction *) {
-    E.DeoptBundleSource = Anchor->DeoptSource;
+    if (Anchor) {
+      E.DeoptBundleSource = Anchor->DeoptSource;
+    } else {
+      E.CommitToOriginalAllocation = true;
+      keepOriginalAllocation(ID);
+    }
   };
   auto FlipState = [&](jeandle::ObjectID Oid) {
     CurrentState.getObjectStateForModification(Oid).escape(
@@ -5202,6 +5204,23 @@ void Analyzer::materializeAt(jeandle::ObjectID ID, Instruction *InsertBefore,
       DropInnerAliases, ComputeSafeIP, SetEffectFlags, FlipState,
       MaterializedValue};
   ensureMaterialized(ID, C);
+}
+
+void Analyzer::keepOriginalAllocation(jeandle::ObjectID ID) {
+  bool Removed = false;
+  for (auto &Kv : Result.BlockEffects) {
+    Kv.second.eraseIf([&](const jeandle::Effect &E) {
+      if (E.ObjID == ID && isa<jeandle::EliminateAllocationEffect>(E)) {
+        Removed = true;
+        return true;
+      }
+      return false;
+    });
+  }
+  if (Removed) {
+    --Result.VirtualizationDelta;
+    ++Result.AllocationDelta;
+  }
 }
 
 void Analyzer::dropEffectsFor(jeandle::ObjectID ID) {
@@ -5244,6 +5263,7 @@ void Analyzer::validateAllocationEliminationPlans() {
   SmallVector<PlannedEdgeRemoval, 8> PlannedEdgeRemovals;
   DenseMap<jeandle::ObjectID, DenseSet<Value *>> DeoptRecordedValues;
   DenseSet<jeandle::ObjectID> HasGlobalPointerRewrite;
+  DenseSet<jeandle::ObjectID> HasAllocationElimination;
   for (const auto &Kv : Result.BlockEffects) {
     for (const auto &E : Kv.second) {
       switch (E.getKind()) {
@@ -5258,11 +5278,13 @@ void Analyzer::validateAllocationEliminationPlans() {
             if (auto *II = dyn_cast<InvokeInst>(Target))
               PlannedEdgeRemovals.push_back(
                   {E.ObjID, II->getParent(), II->getUnwindDest()});
+          if (E.getKind() == jeandle::Effect::Kind::EliminateAllocation)
+            HasAllocationElimination.insert(E.ObjID);
         }
         break;
       case jeandle::Effect::Kind::Materialize:
         if (const auto *M = dyn_cast<jeandle::MaterializeEffect>(&E);
-            M && !M->IsPerPred)
+            M && !M->IsPerPred && !M->CommitToOriginalAllocation)
           HasGlobalPointerRewrite.insert(E.ObjID);
         break;
       case jeandle::Effect::Kind::RecordDeoptState:
@@ -5388,7 +5410,8 @@ void Analyzer::validateAllocationEliminationPlans() {
       jeandle::ObjectID ID = VObjUP->getID();
       auto EIt = Eligible.find(ID);
       bool IsEligible = (EIt != Eligible.end()) && EIt->second;
-      if (!IsEligible || HasGlobalPointerRewrite.count(ID))
+      if (!IsEligible || !HasAllocationElimination.count(ID) ||
+          HasGlobalPointerRewrite.count(ID))
         continue;
       SmallPtrSet<Value *, 16> Visited;
       Visited.insert(VObjUP->AllocationCall);
@@ -5424,6 +5447,8 @@ void Analyzer::commit() {
     for (const auto &E : Kv.second) {
       const auto *M = dyn_cast<jeandle::MaterializeEffect>(&E);
       if (!M)
+        continue;
+      if (M->CommitToOriginalAllocation)
         continue;
       auto *Point = dyn_cast_or_null<Instruction>(
           static_cast<Value *>(M->InsertBefore));
@@ -5507,9 +5532,8 @@ void Analyzer::commit() {
   // For each surviving (eligible) VO, classify based on whether ANY
   // Materialize effect survived in the committed plan:
   //   * no Materialize  -> NeverEscapes      (alloc fully eliminated)
-  //   * any Materialize -> PartiallyEscapes  (alloc eliminated on the
-  //                                           virtual path, re-emitted on
-  //                                           the escape path)
+  //   * any Materialize -> PartiallyEscapes  (virtual until an escape point,
+  //                                           then committed to a real object)
   // Maps to NEVER vs PARTIAL vs ALWAYS escape classification.
   // -------------------------------------------------------------------------
   DenseSet<jeandle::ObjectID> HasSurvivingMaterialize;

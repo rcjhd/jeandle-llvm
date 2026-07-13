@@ -667,6 +667,74 @@ static void relocateDependentMaterializes(
   }
 }
 
+static void commitVirtualStateToOriginal(
+    const jeandle::PEAResult &Result, const jeandle::MaterializeEffect &E,
+    const DenseMap<const jeandle::MaterializeEffect *, Instruction *>
+        &CascadeKeyOf,
+    DenseMap<Value *, Value *> &ValueReplacements) {
+  Instruction *InsertBefore = dyn_cast_or_null<Instruction>(E.InsertBefore);
+  assert(InsertBefore && "commit-to-original insertion point was erased");
+
+  Value *OrigAlloc = E.Target;
+  IRBuilder<> B(InsertBefore);
+  if (InsertBefore->getDebugLoc())
+    B.SetCurrentDebugLocation(InsertBefore->getDebugLoc());
+  const DataLayout &DL = InsertBefore->getModule()->getDataLayout();
+  Type *I8 = Type::getInt8Ty(InsertBefore->getContext());
+
+  for (const auto &FE : E.FieldEntries) {
+    Value *V = nullptr;
+    if (FE.isScalar())
+      V = FE.getScalar();
+    else if (FE.isMaterializedRef())
+      V = FE.getMaterialized();
+    else {
+      assert(false && "VirtualRef field entries must be materialized");
+      continue;
+    }
+    V = resolveValueReplacement(V, ValueReplacements);
+    if (!V)
+      continue;
+    Value *Slot = B.CreateInBoundsGEP(I8, OrigAlloc, B.getInt64(FE.Offset),
+                                      "pea.matslot");
+    uint64_t StoreSz = DL.getTypeStoreSize(V->getType()).getFixedValue();
+    Align NaturalAlign(llvm::PowerOf2Ceil(StoreSz ? StoreSz : 1));
+    StoreInst *S = B.CreateAlignedStore(V, Slot, NaturalAlign);
+    S->setAtomic(AtomicOrdering::Unordered);
+  }
+
+  auto EmitLock = [&](Value *Recv, Function *Callee,
+                      ArrayRef<WeakTrackingVH> NonReceiverArgs) {
+    if (!Callee)
+      return;
+    SmallVector<Value *, 4> Args;
+    Args.push_back(Recv);
+    for (const WeakTrackingVH &VH : NonReceiverArgs) {
+      Value *A = resolveValueReplacement(static_cast<Value *>(VH),
+                                         ValueReplacements);
+      assert(A && "materialized lock argument was deleted without replacement");
+      if (!A)
+        return;
+      Args.push_back(A);
+    }
+    CallInst *Enter = B.CreateCall(Callee, Args);
+    Enter->setCallingConv(CallingConv::Hotspot_JIT);
+  };
+
+  Instruction *EscapeKey = CascadeKeyOf.lookup(&E);
+  auto MaxIt = EscapeKey ? Result.MaxSeqForEscapePoint.find(EscapeKey)
+                         : Result.MaxSeqForEscapePoint.end();
+  if (MaxIt != Result.MaxSeqForEscapePoint.end() && E.SeqNo == MaxIt->second) {
+    auto It = Result.EscapePointLocks.find(EscapeKey);
+    if (It != Result.EscapePointLocks.end())
+      for (const jeandle::MergedLock &ML : It->second)
+        EmitLock(ML.SourceEffect->Target, ML.Callee, ML.NonReceiverArgs);
+  } else if (MaxIt == Result.MaxSeqForEscapePoint.end()) {
+    for (const jeandle::MaterializedLock &ML : E.Locks)
+      EmitLock(OrigAlloc, ML.Callee, ML.NonReceiverArgs);
+  }
+}
+
 static void applyMaterialize(
     Function &F, const jeandle::PEAResult &Result,
     const jeandle::MaterializeEffect &E,
@@ -690,6 +758,11 @@ static void applyMaterialize(
   jeandle::VirtualObject &VObj = *Result.VirtualObjects[E.ObjID];
   CallBase *OrigAlloc = VObj.AllocationCall;
   assert(OrigAlloc == E.Target);
+
+  if (E.CommitToOriginalAllocation) {
+    commitVirtualStateToOriginal(Result, E, CascadeKeyOf, ValueReplacements);
+    return;
+  }
 
   Module *M = F.getParent();
   LLVMContext &Ctx = M->getContext();
@@ -1295,10 +1368,10 @@ void jeandle::RecordDeoptStateEffect::apply(jeandle::TransformContext &Ctx) {
 }
 
 void jeandle::MaterializeEffect::apply(jeandle::TransformContext &Ctx) {
-  // Emit the materialization sequence. The original allocation's uses are
-  // resolved later by the point-sensitive resolution sub-pass (not RAUW'd
-  // inline); the allocation itself is erased by EliminateAllocation in Pass 2.
-  // The cascade maps drive the two-phase field-store replay (cyclic fields).
+  // Emit a replacement allocation or commit into the original allocation.
+  // Replacement allocations are resolved later by the point-sensitive
+  // resolution sub-pass and erase the original allocation in Pass 2. The
+  // cascade maps drive their two-phase field-store replay (cyclic fields).
   applyMaterialize(Ctx.F, Ctx.Result, *this, Ctx.NewAllocFor, Ctx.MatPerBlock,
                    Ctx.BlockRename, Ctx.Defs, Ctx.NewInvOf, Ctx.IsCascadeTail,
                    Ctx.CascadeKeyOf, Ctx.CascadeGroups,
@@ -1562,10 +1635,9 @@ static bool rewriteDeoptBundlesWithLazyObjects(
   for (CallBase *CB : Calls) {
     if (!CB->getParent())
       continue;
-    // PEA-owned allocation calls are named by later effects or by Defs used for
-    // point-sensitive alias resolution. Rebuilding those calls here would leave
-    // stale instruction pointers behind. Ordinary surviving allocations are safe
-    // to clone when only their deopt bundle needs canonicalization.
+    // Deleted originals remain named by Pass 2 effects. New materialization
+    // allocations are referenced by Defs and already carry rebuilt bundles.
+    // Retained originals are safe to clone after Pass 1.
     if (jeandle::pea::isJeandleAllocation(CB) &&
         ProtectedAllocations.contains(CB))
       continue;
@@ -1644,6 +1716,12 @@ static bool rewriteDeoptBundlesWithLazyObjects(
 
     CallBase *NewCB = CallBase::Create(CB, Bundles, CB->getIterator());
     NewCB->copyMetadata(*CB, /*WL=*/{});
+    auto DefSelf = Defs.find(CB);
+    if (DefSelf != Defs.end()) {
+      auto Saved = std::move(DefSelf->second);
+      Defs.erase(DefSelf);
+      Defs[NewCB] = std::move(Saved);
+    }
     auto LazySelf = LazyInfoForDef.find(CB);
     if (LazySelf != LazyInfoForDef.end()) {
       LazyDeoptObject Saved = LazySelf->second;
@@ -1746,8 +1824,7 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
   DenseSet<CallBase *> ProtectedAllocations;
   for (const auto &Kv : Result.BlockEffects) {
     for (const auto &E : Kv.second) {
-      if (!isa<jeandle::MaterializeEffect>(&E) &&
-          !isa<jeandle::EliminateAllocationEffect>(&E))
+      if (!isa<jeandle::EliminateAllocationEffect>(&E))
         continue;
       if (auto *CB = dyn_cast_or_null<CallBase>(E.getTarget()))
         ProtectedAllocations.insert(CB);
@@ -1989,8 +2066,6 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
   // -------------------------------------------------------------------------
   if (!Defs.empty()) {
     for (const auto &Kv : Defs) {
-      if (auto *CB = dyn_cast<CallBase>(Kv.first))
-        ProtectedAllocations.insert(CB);
       for (Value *Def : Kv.second)
         if (auto *CB = dyn_cast<CallBase>(Def))
           ProtectedAllocations.insert(CB);
