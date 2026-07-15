@@ -1663,18 +1663,10 @@ static bool rewriteDeoptBundlesWithLazyObjects(
         if (const LazyDeoptObject *Obj = MatchCallSnapshot(Resolved))
           return Obj;
 
-      if (Value *Dom = findClosestDominatingDef(Resolved, CB, Defs, DT)) {
-        auto LazyIt = LazyInfoForDef.find(Dom);
-        if (LazyIt != LazyInfoForDef.end())
-          return &LazyIt->second;
-      }
-
-      if (auto It = LazyInfoForDef.find(Resolved);
-          It != LazyInfoForDef.end()) {
-        if (!DT.dominates(Resolved, CB))
-          return nullptr;
-        return &It->second;
-      }
+      // A dominating replacement allocation means the object is real at this
+      // deopt point. Normalize the operand to that definition below instead of
+      // reusing the allocation's pre-materialization lazy snapshot. The latter
+      // is valid only for the replacement allocation's own OOM/deopt state.
       return nullptr;
     };
     auto LookupByID = [&](jeandle::ObjectID ID) -> const LazyDeoptObject * {
@@ -1685,20 +1677,7 @@ static bool rewriteDeoptBundlesWithLazyObjects(
             return &Obj;
       }
 
-      Value *Dom = nullptr;
-      const LazyDeoptObject *Best = nullptr;
-      for (const auto &Kv : LazyInfoForDef) {
-        if (Kv.second.ID != ID)
-          continue;
-        auto *DI = dyn_cast<Instruction>(Kv.first);
-        if (!DI || !DT.dominates(Kv.first, CB))
-          continue;
-        if (isCloserDominatingDef(Kv.first, Dom, DT)) {
-          Dom = Kv.first;
-          Best = &Kv.second;
-        }
-      }
-      return Best;
+      return nullptr;
     };
 
     auto NormalizeDeoptInput = [&](Value *V) -> Value * {
