@@ -3531,6 +3531,7 @@ bool Analyzer::processStore(StoreInst *SI) {
     Result.addBlockEffect(std::move(E));
     return true;
   }
+  Val = Aliases.resolveScalarAlias(Val);
   FieldStates[*BaseID][*Offset] = jeandle::FieldValue::scalar(Val);
 
   auto E = std::make_unique<jeandle::EliminateStoreEffect>();
@@ -3634,7 +3635,7 @@ void Analyzer::processLoad(LoadInst *LI) {
   }
 
   if (Existing->isScalar()) {
-    Value *V = Existing->getScalar();
+    Value *V = Aliases.resolveScalarAlias(Existing->getScalar());
     // Coerce to LoadTy: same-type passthrough or same-bit-width primitive↔
     // primitive reinterpret (bitcast). Pointer↔primitive, cross-AS pointer
     // pairs, and any cross-width mismatch (narrowing/widening) bail to
@@ -3668,8 +3669,6 @@ void Analyzer::processLoad(LoadInst *LI) {
     // pointer, and (b) at transform time, applyMaterialize records the
     // OrigInnerAlloc → NewInv definition; the point-sensitive resolution
     // sub-pass rewrites the materialized uses to the new invoke.
-    // (Belt-and-suspenders: the ReplaceLoad handler also looks up
-    // E.Replacement through NewAllocFor.)
     jeandle::ObjectID InnerID = Existing->getVirtualRef();
 
     if (!Eligible.lookup(InnerID)) {
@@ -3780,6 +3779,8 @@ void Analyzer::processLoad(LoadInst *LI) {
 
 void Analyzer::emitReplaceCall(CallBase *CB, Value *Replacement,
                                jeandle::ObjectID ID) {
+  if (Replacement)
+    Replacement = Aliases.resolveScalarAlias(Replacement);
   auto E = std::make_unique<jeandle::ReplaceCallEffect>();
   E->Block = CB->getParent();
   E->Target = CB;

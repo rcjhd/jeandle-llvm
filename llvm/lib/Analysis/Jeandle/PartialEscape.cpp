@@ -11,6 +11,7 @@
 
 #include "llvm/Analysis/Jeandle/PartialEscape.h"
 
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Analysis/Jeandle/PartialEscapeUtils.h"
 #include "llvm/Analysis/LoopInfo.h"
@@ -463,6 +464,9 @@ void AliasMap::addVirtualAlias(Value *V, ObjectID ID) {
 
 void AliasMap::addScalarAlias(Value *V, Value *Replacement) {
   assert(V && Replacement);
+  assert(V != Replacement && "scalar alias must not point to itself");
+  assert(!getScalarAlias(Replacement) &&
+         "scalar alias replacement must already be canonical");
   ScalarAliases[V] = Replacement;
 }
 
@@ -481,6 +485,19 @@ std::optional<ObjectID> AliasMap::getVirtualAlias(Value *V) const {
 Value *AliasMap::getScalarAlias(Value *V) const {
   auto It = ScalarAliases.find(V);
   return It == ScalarAliases.end() ? nullptr : It->second;
+}
+
+Value *AliasMap::resolveScalarAlias(Value *V) const {
+  assert(V && "cannot resolve a null scalar value");
+  SmallPtrSet<Value *, 8> Visited;
+  while (Value *Next = getScalarAlias(V)) {
+    bool Inserted = Visited.insert(V).second;
+    assert(Inserted && "cycle in scalar alias map");
+    if (!Inserted)
+      return V;
+    V = Next;
+  }
+  return V;
 }
 
 void AliasMap::clear() {

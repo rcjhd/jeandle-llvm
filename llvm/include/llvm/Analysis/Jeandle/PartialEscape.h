@@ -434,6 +434,10 @@ public:
 
   std::optional<ObjectID> getVirtualAlias(Value *V) const;
   Value *getScalarAlias(Value *V) const;
+  // Return the canonical leaf of a scalar replacement chain. Every scalar
+  // value captured by analysis state or a deferred replacement effect must
+  // pass through this helper first.
+  Value *resolveScalarAlias(Value *V) const;
 
   bool hasVirtualInputs(Instruction *I) const {
     return HasVirtualInputs.count(I);
