@@ -4417,11 +4417,14 @@ static bool visitDeoptRecords(
     } else if (VT == jeandle::DeoptValueEncoding::MonitorType) {
       Next = jeandle::deoptRecordEnd(I, E, 3);
     } else if (VT == jeandle::DeoptValueEncoding::LazyObjectType) {
-      assert(I + 2 < E && "truncated lazy-object deopt record");
-      auto *CountC = dyn_cast<ConstantInt>(Inputs[I + 2]);
+      bool IsArray = Enc.basicType() == jeandle::T_ARRAY;
+      unsigned CountIndex = I + (IsArray ? 3 : 2);
+      assert(CountIndex < E && "truncated lazy-object deopt record");
+      auto *CountC = dyn_cast<ConstantInt>(Inputs[CountIndex]);
       assert(CountC && "lazy-object field count must be constant");
       unsigned Count = static_cast<unsigned>(CountC->getZExtValue());
-      Next = jeandle::deoptRecordEnd(I, E, 3 + Count * 3);
+      unsigned HeaderSize = IsArray ? 4 : 3;
+      Next = jeandle::deoptRecordEnd(I, E, HeaderSize + Count * 3);
     } else {
       llvm_unreachable("unknown deopt value type");
     }
@@ -4500,7 +4503,17 @@ void Analyzer::recordDeoptBundleState(CallBase *CB) {
     }
 
     jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
-    if (!VObj.isInstance() || VObj.Klass == 0) {
+    // Object-array field states use narrow oops when compressed oops are
+    // enabled. Keep them conservative until PEA models that storage form
+    // end-to-end; primitive arrays are independent and can be reconstructed
+    // by the element-count-aware lazy-object protocol.
+    if (VObj.isArray() && VObj.ArrayElementType &&
+        VObj.ArrayElementType->isPointerTy()) {
+      markIneligible(ID);
+      CaptureStates[ID] = CaptureState::Failed;
+      return false;
+    }
+    if ((!VObj.isInstance() && !VObj.isArray()) || VObj.Klass == 0) {
       CaptureStates[ID] = CaptureState::Failed;
       return false;
     }
@@ -4526,6 +4539,31 @@ void Analyzer::recordDeoptBundleState(CallBase *CB) {
         const jeandle::FieldValue &FV = FSIt->second.lookup(Off);
         if (FV.isUnknown())
           continue;
+
+        if (VObj.isArray() && VObj.ArrayIndexScale != 0) {
+          int64_t Adj = Off - static_cast<int64_t>(VObj.ArrayBaseOffset);
+          int64_t Scale = static_cast<int64_t>(VObj.ArrayIndexScale);
+          if (Adj < 0 || Adj % Scale != 0 ||
+              static_cast<uint64_t>(Adj / Scale) >= VObj.ArrayLength) {
+            markIneligible(ID);
+            CaptureStates[ID] = CaptureState::Failed;
+            return false;
+          }
+
+          bool ExactElement = false;
+          for (const jeandle::VirtualObject::FieldDesc &F : VObj.Fields) {
+            if (F.Offset != Off)
+              continue;
+            ExactElement =
+                F.ByteSize == VObj.ArrayIndexScale && !F.IsReference;
+            break;
+          }
+          if (!ExactElement) {
+            markIneligible(ID);
+            CaptureStates[ID] = CaptureState::Failed;
+            return false;
+          }
+        }
 
         if (FV.isScalar()) {
           if (!DominatesDeoptPoint(FV.getScalar())) {

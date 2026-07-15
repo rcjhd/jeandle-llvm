@@ -191,6 +191,10 @@ struct LazyDeoptObject {
   jeandle::ObjectID ID = jeandle::InvalidObjectID;
   // HotSpot Klass address used for reconstruction.
   uintptr_t Klass = 0;
+  // Arrays use an element-count-aware lazy-object record.
+  bool IsArray = false;
+  // Logical Java array length. Unused for instances.
+  uint32_t ArrayLength = 0;
   // SSA aliases matched in the bundle.
   SmallVector<WeakTrackingVH, 2> Values;
   // Field state at this deopt point.
@@ -203,6 +207,8 @@ struct LazyDeoptObject {
   LazyDeoptObject &operator=(const LazyDeoptObject &O) {
     ID = O.ID;
     Klass = O.Klass;
+    IsArray = O.IsArray;
+    ArrayLength = O.ArrayLength;
     Values.clear();
     for (const WeakTrackingVH &VH : O.Values)
       if (Value *V = VH)
@@ -342,6 +348,8 @@ static LazyDeoptObject buildLazyDeoptObject(
   LazyDeoptObject Obj;
   Obj.ID = VObj.getID();
   Obj.Klass = VObj.Klass;
+  Obj.IsArray = VObj.isArray();
+  Obj.ArrayLength = VObj.ArrayLength;
 
   for (const auto &FE : FieldEntries) {
     Value *V = nullptr;
@@ -363,6 +371,8 @@ static LazyDeoptObject buildLazyDeoptObject(
   LazyDeoptObject Obj;
   Obj.ID = VObj.getID();
   Obj.Klass = VObj.Klass;
+  Obj.IsArray = VObj.isArray();
+  Obj.ArrayLength = VObj.ArrayLength;
   LLVMContext &Ctx = VObj.AllocationCall->getContext();
 
   for (const auto &FE : FieldEntries) {
@@ -389,10 +399,14 @@ static void appendLazyObjectRecord(SmallVectorImpl<Value *> &Inputs,
   if (!Emitted.insert(Obj.ID).second)
     return;
 
+  jeandle::HotspotBasicType ObjectTy =
+      Obj.IsArray ? jeandle::T_ARRAY : jeandle::T_OBJECT;
   Inputs.push_back(deoptConst(Ctx, lazyObjectDebugId(Obj.ID),
                               jeandle::DeoptValueEncoding::LazyObjectType,
-                              jeandle::T_OBJECT));
+                              ObjectTy));
   Inputs.push_back(i64Const(Ctx, Obj.Klass));
+  if (Obj.IsArray)
+    Inputs.push_back(i64Const(Ctx, Obj.ArrayLength));
   SmallVector<const LazyDeoptField *, 8> LiveFields;
   for (const LazyDeoptField &F : Obj.Fields) {
     Value *FieldVal = F.Val;
@@ -539,11 +553,15 @@ static bool buildLazyDeoptInputs(ArrayRef<Value *> OldInputs,
     }
 
     if (VT == jeandle::DeoptValueEncoding::LazyObjectType) {
-      assert(I + 2 < E && "truncated lazy-object deopt record");
-      auto *CountC = dyn_cast<ConstantInt>(OldInputs[I + 2]);
+      bool IsArray = Enc.basicType() == jeandle::T_ARRAY;
+      unsigned CountIndex = I + (IsArray ? 3 : 2);
+      assert(CountIndex < E && "truncated lazy-object deopt record");
+      auto *CountC = dyn_cast<ConstantInt>(OldInputs[CountIndex]);
       assert(CountC && "lazy-object field count must be constant");
       uint64_t FieldCount = CountC->getZExtValue();
-      unsigned Next = jeandle::deoptRecordEnd(I, E, 3 + FieldCount * 3);
+      unsigned HeaderSize = IsArray ? 4 : 3;
+      unsigned Next =
+          jeandle::deoptRecordEnd(I, E, HeaderSize + FieldCount * 3);
       AppendRange(I, Next);
       I = Next;
       continue;
@@ -853,7 +871,7 @@ static void applyMaterialize(
   // Step 5: collect operand bundles. Bundles come from the analysis-selected
   // DeoptBundleSource (escape point / prior deopt anchor / original allocation)
   // and are copied unchanged except for the deopt bundle, whose slots naming
-  // virtual instance objects are rewritten to LazyObjectType lazy-object
+  // virtual objects are rewritten to LazyObjectType lazy-object
   // records. That avoids putting OrigAlloc into NewInv's own deopt bundle,
   // which would otherwise become a self-reference after point-sensitive
   // materialized-use resolution.
@@ -872,7 +890,11 @@ static void applyMaterialize(
   CallBase *DeoptSource = BundleSource ? BundleSource : OrigAlloc;
 
   std::optional<LazyDeoptObject> LazyInfo;
-  if (VObj.isInstance() && VObj.Klass != 0)
+  bool SupportsLazyDeopt =
+      VObj.isInstance() ||
+      (VObj.isArray() && (!VObj.ArrayElementType ||
+                          !VObj.ArrayElementType->isPointerTy()));
+  if (SupportsLazyDeopt && VObj.Klass != 0)
     LazyInfo = buildLazyDeoptObject(VObj, E.FieldEntries, NewAllocFor,
                                     ValueReplacements);
   auto Lookup = [&](Value *V) -> const LazyDeoptObject * {
@@ -1352,7 +1374,11 @@ void jeandle::RecordDeoptStateEffect::apply(jeandle::TransformContext &Ctx) {
     return;
 
   jeandle::VirtualObject &VObj = *Ctx.Result.VirtualObjects[Snapshot.ID];
-  if (!VObj.isInstance() || VObj.Klass == 0)
+  bool SupportsLazyDeopt =
+      VObj.isInstance() ||
+      (VObj.isArray() && (!VObj.ArrayElementType ||
+                          !VObj.ArrayElementType->isPointerTy()));
+  if (!SupportsLazyDeopt || VObj.Klass == 0)
     return;
 
   LazyDeoptObject Obj =
