@@ -13,6 +13,7 @@
 
 #include "llvm/Analysis/Jeandle/PartialEscape.h"
 #include "llvm/IR/PassManager.h"
+#include "llvm/Jeandle/Pipeline.h"
 
 namespace llvm {
 
@@ -22,7 +23,13 @@ class PartialEscapeAnalysis : public AnalysisInfoMixin<PartialEscapeAnalysis> {
 
 public:
   using Result = jeandle::PEAResult;
+  explicit PartialEscapeAnalysis(jeandle::PartialEscapeOptions Options = {})
+      : Options(Options) {}
+
   Result run(Function &F, FunctionAnalysisManager &FAM);
+
+private:
+  jeandle::PartialEscapeOptions Options;
 };
 
 } // namespace llvm

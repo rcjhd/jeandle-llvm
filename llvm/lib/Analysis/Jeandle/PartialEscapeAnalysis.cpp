@@ -303,9 +303,11 @@ static bool resolveStrictLockOrder() {
 
 class Analyzer {
 public:
-  Analyzer(Function &F, DominatorTree &DT, LoopInfo &LI)
+  Analyzer(Function &F, DominatorTree &DT, LoopInfo &LI,
+           jeandle::PartialEscapeOptions Options)
       : F(F), DT(DT), LI(LI), DL(F.getParent()->getDataLayout()),
-        StrictLockOrder(resolveStrictLockOrder()) {}
+        StrictLockOrder(resolveStrictLockOrder()),
+        LockEliminationEnabled(Options.EliminateLocks) {}
 
   jeandle::PEAResult run();
 
@@ -347,6 +349,7 @@ private:
   // Cached "strict lock order" decision for this run; see
   // resolveStrictLockOrder() for the precedence rules.
   const bool StrictLockOrder;
+  const bool LockEliminationEnabled;
   jeandle::PEAResult Result;
 
   // ---------------------------------------------------------------------
@@ -3945,6 +3948,9 @@ void Analyzer::materializeVirtualLocksBefore(CallBase *MonEnter) {
 }
 
 bool Analyzer::foldMonitorEnter(CallBase *CB) {
+  if (!LockEliminationEnabled)
+    return false;
+
   if (CB->arg_size() < 1)
     return false;
   auto BaseID = jeandle::pea::resolveVirtualRef(CB->getArgOperand(0),
@@ -3995,6 +4001,9 @@ bool Analyzer::foldMonitorEnter(CallBase *CB) {
 }
 
 bool Analyzer::foldMonitorExit(CallBase *CB) {
+  if (!LockEliminationEnabled)
+    return false;
+
   if (CB->arg_size() < 1)
     return false;
   auto BaseID = jeandle::pea::resolveVirtualRef(CB->getArgOperand(0),
@@ -6646,6 +6655,6 @@ PartialEscapeAnalysis::run(Function &F, FunctionAnalysisManager &FAM) {
   auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
   auto &LI = FAM.getResult<LoopAnalysis>(F);
 
-  Analyzer A(F, DT, LI);
+  Analyzer A(F, DT, LI, Options);
   return A.run();
 }

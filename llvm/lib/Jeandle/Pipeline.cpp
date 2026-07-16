@@ -41,6 +41,9 @@ Pipeline::Pipeline(OptimizationLevel level, LLVMContext &Ctx,
   // Register all the basic analyses with the managers.
   PB.registerModuleAnalyses(MAM);
   PB.registerCGSCCAnalyses(CGAM);
+  FAM.registerPass([PartialEscape = Options.PartialEscape] {
+    return PartialEscapeAnalysis(PartialEscape);
+  });
   PB.registerFunctionAnalyses(FAM);
   PB.registerLoopAnalyses(LAM);
   PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
@@ -67,59 +70,21 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
     PM.addPass(JeandleInlineDriver(/*InlineAccessorsOnly=*/true));
     break;
   }
-  // Pre-PEA cleanup. PEA's correctness depends on the CFG containing no
-  // statically-unreachable edges: a constant-condition branch's dead arm
-  // would otherwise feed merges and PHIs with no-op contributions and (for
-  // edges into blocks with side-effecting calls) cause spurious
-  // materialisations of virtuals on paths that never execute. We delegate
-  // this to upstream LLVM: SimplifyCFG folds constant-cond branches and
-  // deletes blocks unreachable from entry (via removeUnreachableBlocks);
-  // ADCE drops the now-dead instructions that fed the folded conditions;
-  // InstCombine exposes any further foldable conditions for the next
-  // iteration. LoopSimplify runs after SimplifyCFG so it restores the
-  // unique-preheader / single-backedge canonical form that SimplifyCFG
-  // may have dismantled — processLoop relies on it for every natural
-  // loop, and falls back gracefully for irreducible or indirectbr-entered
-  // loops that LoopSimplify cannot recover. This mirrors the
-  // inter-iteration canonicalisation that PartialEscapeIterative runs
-  // between rounds.
-  PM.addPass(createModuleToFunctionPassAdaptor(ADCEPass()));
-  PM.addPass(createModuleToFunctionPassAdaptor(SimplifyCFGPass()));
-  PM.addPass(createModuleToFunctionPassAdaptor(LoopSimplifyPass()));
-  PM.addPass(createModuleToFunctionPassAdaptor(InstCombinePass()));
-  // Outer fixpoint. PartialEscapeIterative wraps the
-  // analyze+transform pair in a bounded loop with InstCombine/SimplifyCFG/
-  // ADCE between rounds. The iteration cap is controlled by
-  // `-jeandle-pea-iterations=N` (default 2).
-  //
-  // Pipeline position decision.
-  //   Jeandle runs PEA at exactly ONE position. JavaOperationLower(0) is
-  //   hoisted above the inline driver (so phase-0 helpers like
-  //   load_klass/instanceof/arraylength/idiv are inlined before inlining
-  //   runs); PEA runs after the driver and the pre-PEA cleanup, before
-  //   InstSimplify, TypeCheckElimination, and the standard O2 pipeline.
-  //   PEA still sees every allocation site: the named alloc intrinsics
-  //   `jeandle.new_instance` / `jeandle.new_array` carry `"lower-phase"="1"`
-  //   and are left untouched by JavaOperationLower(0) (phase-0 only) and by
-  //   every pass downstream of PEA, surviving until JavaOperationLower(1)
-  //   below. addrspace(1) survives until RewriteStatepointsForGC rewrites it
-  //   to gc-managed pointers.
-  //
-  //   Considered and rejected: a second `PartialEscapeIterative` after the
-  //   O2 pipeline. The named intrinsics and addrspace(1) survive through
-  //   O2 + GC barriers, so it would be technically feasible. However:
-  //     - Phase-0 helpers (load_klass / instanceof / arraylength /
-  //       div/rem) do not allocate or escape; inlining them via
-  //       JavaOperationLower(0) cannot expose new allocation-virtualization
-  //       opportunities for a second PEA round to capture.
-  //     - O2's stock passes (InstCombine, SimplifyCFG, GVN, SROA, LICM,
-  //       loop unroll) cannot SROA or fold addrspace(1) loads — they have
-  //       no Java semantic model for the heap — so they neither destroy
-  //       PEA invariants nor expose meaningful new escape decisions.
-  //     - Intra-PEA fixpoint already iterates through any re-foldable
-  //       materializations exposed by InstCombine+SimplifyCFG+ADCE between
-  //       rounds.
-  PM.addPass(createModuleToFunctionPassAdaptor(PartialEscapeIterative()));
+  if (Options.PartialEscape.Enable) {
+    // Pre-PEA cleanup for PEA. 
+    PM.addPass(createModuleToFunctionPassAdaptor(ADCEPass()));
+    PM.addPass(createModuleToFunctionPassAdaptor(SimplifyCFGPass()));
+    PM.addPass(createModuleToFunctionPassAdaptor(LoopSimplifyPass()));
+    PM.addPass(createModuleToFunctionPassAdaptor(InstCombinePass()));
+    // Outer fixpoint. PartialEscapeIterative wraps the
+    // analyze+transform pair in a bounded loop with InstCombine/SimplifyCFG/
+    // ADCE between rounds. The iteration cap is controlled by
+    // `-jeandle-pea-iterations=N` (default 2).
+    // Pipeline position decision.
+    //   Jeandle runs PEA at exactly ONE position. The slot is BEFORE
+    //   JavaOperationLower(0) and after JeandleInlineDriver().
+    PM.addPass(createModuleToFunctionPassAdaptor(PartialEscapeIterative()));
+  }
   PM.addPass(createModuleToFunctionPassAdaptor(InstSimplifyPass()));
   PM.addPass(createModuleToFunctionPassAdaptor(TypeCheckElimination()));
   PM.addPass(createModuleToFunctionPassAdaptor(RepeatedConstantFolding()));
