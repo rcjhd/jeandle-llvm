@@ -6517,7 +6517,12 @@ void Analyzer::processLoopExit(Loop *L) {
     for (jeandle::ObjectID ID : Vs) {
       if (!Eligible.lookup(ID))
         continue;
-      // Materialise at the exiting block's terminator. The IP is the
+      jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
+      Value *Allocation = VObj.AllocationCall;
+      auto *AllocationInst = dyn_cast_or_null<Instruction>(Allocation);
+      if (!AllocationInst || !L->contains(AllocationInst->getParent()))
+        continue;
+      // Materialise at the exiting block terminator. The IP is the
       // last legal point inside the loop body; the EH pad inherits a
       // fully-materialised state.
       materializeAtPredFromExitInfo(ID, ExitingBB, Exit,
