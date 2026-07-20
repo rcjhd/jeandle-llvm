@@ -1143,9 +1143,6 @@ private:
     function_ref<void(ArrayRef<LockEnter>, jeandle::ObjectID,
                       jeandle::MaterializeEffect &E)>
         CaptureLocksIntoEffect;
-    // Drop alias-map entries resolving to a just-materialized inner (live
-    // only).
-    function_ref<void(jeandle::ObjectID)> DropInnerAliases;
     // Compute the safe materialization insertion point.
     function_ref<Instruction *()> ComputeSafeIP;
     // Flip the per-object state to materialized (live CurrentState vs
@@ -5670,8 +5667,8 @@ bool Analyzer::isValueAvailableAt(Value *Root, Instruction *IP) {
 // materialization algorithm shared by the escape-point path (materializeAt) and
 // the merge-driven per-predecessor path (materializeAtPredFromExitInfo). The
 // per-path differences are supplied via MaterializeContext C (operative state
-// maps, idempotency set, recursion target, lock-capture phase-2 timing, alias
-// drop, safe IP, effect flags, state flip), keeping this body path-agnostic.
+// maps, idempotency set, recursion target, lock-capture phase-2 timing,
+// safe IP, effect flags, state flip), keeping this body path-agnostic.
 void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
   if (C.MaterializedSet.count(ID))
     return; // idempotent — first escape wins; also breaks nested-cycles.
@@ -5791,8 +5788,6 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
         // updateStatesForMaterialized: every other still-tracked object whose
         // FieldStates references InnerID must also flip to MaterializedRef.
         updateOtherStatesForMaterialized(InnerID, InnerVal, C.FieldStates);
-        // Drop alias-map entries resolving to InnerID (live path only).
-        C.DropInnerAliases(InnerID);
       }
     }
   }
@@ -5949,14 +5944,6 @@ void Analyzer::materializeAt(jeandle::ObjectID ID, Instruction *InsertBefore,
         OS.clearLocks();
     }
   };
-  auto DropInnerAliases = [&](jeandle::ObjectID InnerID) {
-    SmallVector<Value *, 4> ToDrop;
-    for (auto &AKv : Aliases.virtualAliasesView())
-      if (AKv.second == InnerID)
-        ToDrop.push_back(AKv.first);
-    for (Value *V : ToDrop)
-      Aliases.resetAlias(V);
-  };
   auto ComputeSafeIP = [&]() -> Instruction * {
     // Escape-point placement (Graal materializeBefore=node,
     // PartialEscapeClosure.ensureMaterialized -> materializeBefore): always
@@ -6027,7 +6014,7 @@ void Analyzer::materializeAt(jeandle::ObjectID ID, Instruction *InsertBefore,
   MaterializeContext C{
       FieldStates,      LockCounts,    LiveLockEnters, Materialized,
       Reason,           Recurse,       ClearLockState, CaptureLocksIntoEffect,
-      DropInnerAliases, ComputeSafeIP, FlipState,
+      ComputeSafeIP, FlipState,
       MaterializedValue};
   ensureMaterialized(ID, C);
 }
@@ -6690,7 +6677,6 @@ void Analyzer::materializeAtPredFromExitInfo(
                                    jeandle::MaterializeEffect &E) {
     captureMaterializedLocks(Stack, E);
   };
-  auto DropInnerAliasesNop = [](jeandle::ObjectID) {};
   // Field-replay value: OrigAlloc, identical to the live path. Graal uses a
   // distinct AllocatedObjectNode per predecessor as the field value
   // (Graal PartialEscapeBlockState); LLVM's analysis/transform split forbids
@@ -6720,7 +6706,6 @@ void Analyzer::materializeAtPredFromExitInfo(
                        Recurse,
                        ClearLockState,
                        CaptureLocksIntoEffect,
-                       DropInnerAliasesNop,
                        ComputeSafeIP,
                        FlipState,
                        MaterializedValue};
