@@ -64,6 +64,7 @@
 #include "llvm/IR/Jeandle/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Jeandle/JeandleTransformUtils.h"
@@ -71,6 +72,32 @@
 #include "llvm/Transforms/Utils/Local.h"
 
 using namespace llvm;
+
+static Value *coerceMaterializedFieldValue(IRBuilder<> &B, Value *V,
+                                           Type *DeclaredType) {
+  if (!DeclaredType || V->getType() == DeclaredType)
+    return V;
+
+  auto *FromTy = dyn_cast<PointerType>(V->getType());
+  auto *ToTy = dyn_cast<PointerType>(DeclaredType);
+  if (!FromTy || !ToTy)
+    report_fatal_error("materialized reference field must remain a pointer");
+
+  if (FromTy->getAddressSpace() != jeandle::AddrSpace::JavaHeapAddrSpace ||
+      ToTy->getAddressSpace() != jeandle::AddrSpace::NarrowOopAddrSpace)
+    report_fatal_error(
+        "unsupported materialized reference representation conversion");
+
+  Module *M = B.GetInsertBlock()->getModule();
+  Function *Encode = M->getFunction("jeandle.encode_heap_oop");
+  if (!Encode || Encode->arg_size() != 1 ||
+      Encode->getArg(0)->getType() != FromTy ||
+      Encode->getReturnType() != ToTy)
+    report_fatal_error("module must provide the canonical heap-oop encoder");
+  CallInst *Encoded = B.CreateCall(Encode, {V}, "pea.encode_heap_oop");
+  Encoded->setCallingConv(Encode->getCallingConv());
+  return Encoded;
+}
 
 static bool eraseAllocation(Instruction *Target) {
   assert(Target && "EliminateAllocation target must be non-null");
@@ -296,6 +323,7 @@ static bool applyMaterialize(
             cast<Instruction>(V)->getParent() != nullptr) &&
            "materialize replay value must be a constant, argument, or "
            "in-IR instruction");
+    V = coerceMaterializedFieldValue(SB, V, FE.Value.getDeclaredType());
     Value *Slot =
         SB.CreateInBoundsGEP(I8, MatVal, SB.getInt64(FE.Offset), "pea.matslot");
     // Natural alignment = the field type's store size rounded up to a power of
@@ -954,6 +982,21 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
     if (It == Result.BlockEffects.end())
       continue;
     It->second.apply(Ctx, /*CfgKills=*/true);
+  }
+
+  // Encoding a virtual reference is only a representation change. Once the
+  // virtualized users have gone, remove the now-dead conversion so it cannot
+  // keep an eliminated allocation alive.
+  for (WeakTrackingVH &VH : Result.NarrowOopEncodesToErase) {
+    auto *CB = dyn_cast_or_null<CallBase>((Value *)VH);
+    if (!CB || !CB->getParent() || !CB->use_empty())
+      continue;
+    assert(jeandle::pea::isJeandleEncodeHeapOop(CB) &&
+           "narrow-oop cleanup list contains a non-encode call");
+    if (!isa<CallInst>(CB))
+      continue;
+    CB->eraseFromParent();
+    Changed = true;
   }
 
   // Erase parented Case-B alias PHIs that the analyzer flagged

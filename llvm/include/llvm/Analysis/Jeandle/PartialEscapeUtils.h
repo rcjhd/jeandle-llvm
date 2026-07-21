@@ -54,6 +54,8 @@ bool isJeandlePostBarrier(const CallBase *CB);
 bool isJeandleMonitorEnter(const CallBase *CB);
 bool isJeandleMonitorExit(const CallBase *CB);
 bool isJeandleRegisterFinalizerIfNeeded(const CallBase *CB);
+bool isJeandleEncodeHeapOop(const CallBase *CB);
+bool isJeandleDecodeHeapOop(const CallBase *CB);
 
 // Extract the Java element basic type from an array klass pointer.
 // TODO: returns std::nullopt when VMCallbacks are unavailable; pending

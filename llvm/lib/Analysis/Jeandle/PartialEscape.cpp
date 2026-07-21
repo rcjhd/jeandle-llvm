@@ -60,22 +60,13 @@ int VirtualObject::getOrCreateFieldIndex(int64_t Offset, Type *Ty,
   uint8_t ByteSize = 0;
   bool IsReference = false;
   if (Ty->isPointerTy()) {
-    // Reference field: ptr addrspace(1). Its byte size is the target's Java
-    // heap pointer size (DL.getPointerSize(JavaHeapAddrSpace)) — 8 on the
-    // current 64-bit target, but derived from the DataLayout so a 32-bit or
-    // compressed-oop heap model stays correct rather than hardcoding 8.
-    //
-    // TODO(compressed-oop): narrow-oop (addrspace 3) reference fields are NOT
-    // supported — bail conservatively (-1) instead of asserting (debug) or
-    // modelling the slot at the wrong width (release: getPointerSize(1)=8
-    // where the real slot is 4 bytes -> corrupt field model). Callers treat
-    // -1 as keep-everything-real. PEA as a whole is also gated against
-    // narrow-oop modules in PartialEscapeAnalysis::run; this is the
-    // per-access defense for hand-written / mixed IR.
-    if (Ty->getPointerAddressSpace() != jeandle::AddrSpace::JavaHeapAddrSpace)
+    // Reference fields may be represented as a heap pointer or compressed oop.
+    // Use the declared address space to derive the field width.
+    unsigned AS = Ty->getPointerAddressSpace();
+    if (AS != jeandle::AddrSpace::JavaHeapAddrSpace &&
+        AS != jeandle::AddrSpace::NarrowOopAddrSpace)
       return -1;
-    ByteSize = static_cast<uint8_t>(
-        DL.getPointerSize(jeandle::AddrSpace::JavaHeapAddrSpace));
+    ByteSize = static_cast<uint8_t>(DL.getPointerSize(AS));
     IsReference = true;
   } else {
     unsigned Bits = Ty->getPrimitiveSizeInBits();
@@ -310,9 +301,11 @@ FieldValue FieldValue::scalar(Value *V) {
 FieldValue FieldValue::virtualRef(ObjectID ID, Type *RefTy) {
   assert(ID != InvalidObjectID);
   assert(RefTy && RefTy->isPointerTy() &&
-         RefTy->getPointerAddressSpace() ==
-             jeandle::AddrSpace::JavaHeapAddrSpace &&
-         "virtualRef DeclaredType must be ptr addrspace(1)");
+         (RefTy->getPointerAddressSpace() ==
+              jeandle::AddrSpace::JavaHeapAddrSpace ||
+          RefTy->getPointerAddressSpace() ==
+              jeandle::AddrSpace::NarrowOopAddrSpace) &&
+         "virtualRef DeclaredType must be a Java heap oop");
   FieldValue F;
   F.T = VirtualRef;
   F.Ref = ID;
@@ -320,21 +313,24 @@ FieldValue FieldValue::virtualRef(ObjectID ID, Type *RefTy) {
   return F;
 }
 
-FieldValue FieldValue::materializedRef(Value *Ptr) {
+FieldValue FieldValue::materializedRef(Value *Ptr, Type *DeclaredType) {
   assert(Ptr && Ptr->getType()->isPointerTy());
   FieldValue F;
   F.T = MaterializedRef;
   F.V = Ptr;
-  F.DeclaredType = Ptr->getType();
+  F.DeclaredType = DeclaredType ? DeclaredType : Ptr->getType();
+  assert(F.DeclaredType->isPointerTy());
   return F;
 }
 
 Constant *FieldValue::defaultFor(Type *FieldType) {
   assert(FieldType);
   if (FieldType->isPointerTy()) {
-    assert(FieldType->getPointerAddressSpace() ==
-               jeandle::AddrSpace::JavaHeapAddrSpace &&
-           "reference default must be in JavaHeapAddrSpace");
+    unsigned AS = FieldType->getPointerAddressSpace();
+    assert((AS == jeandle::AddrSpace::JavaHeapAddrSpace ||
+            AS == jeandle::AddrSpace::NarrowOopAddrSpace) &&
+           "reference default must be a Java heap oop");
+    (void)AS;
     return ConstantPointerNull::get(cast<PointerType>(FieldType));
   }
   return Constant::getNullValue(FieldType);
@@ -348,9 +344,9 @@ bool FieldValue::shallowEquals(const FieldValue &O) const {
     return true;
   case Scalar:
   case MaterializedRef:
-    return (Value *)V == (Value *)O.V;
+    return (Value *)V == (Value *)O.V && DeclaredType == O.DeclaredType;
   case VirtualRef:
-    return Ref == O.Ref;
+    return Ref == O.Ref && DeclaredType == O.DeclaredType;
   }
   return false;
 }

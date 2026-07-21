@@ -258,7 +258,7 @@ public:
 
   static FieldValue scalar(Value *V);
   static FieldValue virtualRef(ObjectID ID, Type *RefTy);
-  static FieldValue materializedRef(Value *Ptr);
+  static FieldValue materializedRef(Value *Ptr, Type *DeclaredType = nullptr);
 
   bool isUnknown() const { return T == Unknown; }
   bool isScalar() const { return T == Scalar; }
@@ -993,6 +993,13 @@ public:
   // against a UAF if the inserted coercion is later erased by the dead-code
   // sweep.
   SmallVector<WeakTrackingVH, 4> OwnedInsts;
+
+  // Narrow-oop encode calls whose result represents a virtual object,
+  // including analyzer-created load replacements. Their supported users are
+  // removed or rewritten by Pass 1; the transform erases each call once it
+  // becomes use-empty. Analyzer-created calls are also held by OwnedInsts
+  // until they are inserted or discarded.
+  SmallVector<WeakTrackingVH, 4> NarrowOopEncodesToErase;
 
   // PHI nodes synthesized by mergeStates at ANY in-loop merge block (a loop
   // header OR a non-header block inside a loop), stored separately from

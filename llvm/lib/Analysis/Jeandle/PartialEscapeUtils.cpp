@@ -114,6 +114,14 @@ bool isJeandleRegisterFinalizerIfNeeded(const CallBase *CB) {
   return isJeandleCallNamed(CB, "jeandle.register_finalizer_if_needed");
 }
 
+bool isJeandleEncodeHeapOop(const CallBase *CB) {
+  return isJeandleCallNamed(CB, "jeandle.encode_heap_oop");
+}
+
+bool isJeandleDecodeHeapOop(const CallBase *CB) {
+  return isJeandleCallNamed(CB, "jeandle.decode_heap_oop");
+}
+
 // ===========================================================================
 // Type / klass helpers
 // ===========================================================================

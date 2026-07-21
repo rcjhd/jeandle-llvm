@@ -1011,6 +1011,7 @@ private:
   // processArrayCopy (System.arraycopy → llvm.memcpy/memmove), processMemSet
   // (Arrays.fill → llvm.memset). Until then these shapes fall through to
   // conservative materialization.
+  bool processNarrowOopConversion(CallBase *CB);
   bool processJavaOp(CallBase *CB);
   // Known non-escaping LLVM intrinsics (assume, lifetime/invariant
   // markers, debug, annotations, branch hints, ...) are no-ops for PEA;
@@ -1633,11 +1634,31 @@ Value *Analyzer::coerceToType(Value *V, Type *LoadTy,
   // Pointer↔pointer: pointers don't truncate. Require matching bit width and
   // address spaces. Same-AS same-bitwidth pointers are already type-identical
   // under opaque pointers, so a true pointer coercion is rare; defend against
-  // the cross-AS case.
+  // the cross-AS case, except for the explicit heap-oop encode required when
+  // a materialized wide reference is replayed through a narrow field load.
   if (VTy->isPointerTy() && LoadTy->isPointerTy()) {
+    unsigned VAS = VTy->getPointerAddressSpace();
+    unsigned LAS = LoadTy->getPointerAddressSpace();
+    if (VAS == jeandle::AddrSpace::JavaHeapAddrSpace &&
+        LAS == jeandle::AddrSpace::NarrowOopAddrSpace) {
+      Function *Encode = F.getParent()->getFunction("jeandle.encode_heap_oop");
+      if (!Encode || Encode->arg_size() != 1 ||
+          Encode->getArg(0)->getType() != VTy ||
+          Encode->getReturnType() != LoadTy)
+        return nullptr;
+      CallInst *Call =
+          CallInst::Create(Encode->getFunctionType(), Encode, {V},
+                           "pea.encode_heap_oop");
+      Call->setCallingConv(Encode->getCallingConv());
+      if (InsertContext)
+        Call->setDebugLoc(InsertContext->getDebugLoc());
+      Result.OwnedInsts.emplace_back(Call);
+      Result.NarrowOopEncodesToErase.emplace_back(Call);
+      return Call;
+    }
     if (VBits != LBits)
       return nullptr;
-    if (VTy->getPointerAddressSpace() != LoadTy->getPointerAddressSpace())
+    if (VAS != LAS)
       return nullptr;
     return V;
   }
@@ -2406,6 +2427,10 @@ bool Analyzer::MergeProcessor::mergeFieldStates(jeandle::ObjectID ID) {
           break;
         }
         In = FV.getMaterialized();
+        if (In->getType() != PhiType) {
+          LocalBail = true;
+          break;
+        }
       } else if (FV.isVirtualRef()) {
         if (!PhiType->isPointerTy()) {
           LocalBail = true;
@@ -2457,8 +2482,13 @@ bool Analyzer::MergeProcessor::mergeFieldStates(jeandle::ObjectID ID) {
         // just-materialized inner to MaterializedRef so a sibling successor
         // of the pred (other-than-BB) that later inherits from Preds[i] sees
         // the materialized pointer rather than a stale VirtualRef(InnerID).
+        if (InnerVal->getType() != PhiType) {
+          LocalBail = true;
+          break;
+        }
         Preds[i]->FieldStates[ID][Off] =
-            jeandle::FieldValue::materializedRef(InnerVal);
+            jeandle::FieldValue::materializedRef(InnerVal,
+                                                 FV.getDeclaredType());
         In = InnerVal;
       } else {
         LocalBail = true;
@@ -2491,7 +2521,7 @@ bool Analyzer::MergeProcessor::mergeFieldStates(jeandle::ObjectID ID) {
     PendingPhiEffects.add(std::move(PE));
 
     if (PhiType->isPointerTy())
-      Merged[Off] = jeandle::FieldValue::materializedRef(Phi);
+      Merged[Off] = jeandle::FieldValue::materializedRef(Phi, PhiType);
     else
       Merged[Off] = jeandle::FieldValue::scalar(Phi);
   }
@@ -3197,12 +3227,21 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
           return false;
         }
         In = FV.getMaterialized();
+        if (In->getType() != P.PhiType) {
+          Eligible[NewID] = false;
+          return false;
+        }
       } else if (FV.isVirtualRef()) {
         if (!P.PhiType->isPointerTy()) {
           Eligible[NewID] = false;
           return false;
         }
         jeandle::ObjectID InnerID = FV.getVirtualRef();
+        jeandle::VirtualObject &InnerVO = *Result.VirtualObjects[InnerID];
+        if (InnerVO.AllocationCall->getType() != P.PhiType) {
+          Eligible[NewID] = false;
+          return false;
+        }
         materializeAtPredFromExitInfo(InnerID, Preds[i], *ExitInfos[i],
                                       /*SkipGlobalRAUW=*/false, MatReason::Phi,
                                       /*TargetMerge=*/nullptr);
@@ -3214,7 +3253,8 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
         // matching comment in mergeStates.
         ExitInfos[i]->FieldStates[PerPredIDs[i]][P.Off] =
             jeandle::FieldValue::materializedRef(
-                Result.VirtualObjects[InnerID]->AllocationCall);
+                Result.VirtualObjects[InnerID]->AllocationCall,
+                FV.getDeclaredType());
         In = Result.VirtualObjects[InnerID]->AllocationCall;
       } else {
         Eligible[NewID] = false;
@@ -3245,7 +3285,8 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
     }
     PendingPhiEffects.add(std::move(PE));
     if (P.PhiType->isPointerTy())
-      Merged[P.Off] = jeandle::FieldValue::materializedRef(NewPhi);
+      Merged[P.Off] =
+          jeandle::FieldValue::materializedRef(NewPhi, P.PhiType);
     else
       Merged[P.Off] = jeandle::FieldValue::scalar(NewPhi);
   }
@@ -3450,10 +3491,6 @@ void Analyzer::processInstruction(Instruction *I) {
     // processJavaOp — see the isJeandle* predicates in PartialEscapeUtils.{h,cpp}
     // for which the analyzer actually recognizes.)
     //
-    // TODO(compressed-oop): decode_heap_oop, decode_klass, encode_heap_oop,
-    // and encode_klass are frontend JavaOps deferred until CompressedOops
-    // support lands; explicitly excluded from PEA scope today.
-    //
     // When the frontend grows a new JavaOp, wire its fold in processJavaOp
     // and add the isJeandle* predicate in PartialEscapeUtils.{h,cpp}.
     //
@@ -3471,6 +3508,8 @@ void Analyzer::processInstruction(Instruction *I) {
     // non-escaping shape that needs no transform).
     if (auto *CB = dyn_cast<CallBase>(I)) {
       DeoptBundleHandled.clear(); // defensive: kill any stale per-call state
+      if (processNarrowOopConversion(CB))
+        return;
       if (processJavaOp(CB)) {
         // The call was folded / is a known-safe shape. It may still SURVIVE
         // with a deopt bundle (the fold effect can be dropped at commit when
@@ -4954,6 +4993,68 @@ bool Analyzer::foldICmpEquality(ICmpInst *ICmp) {
   return true;
 }
 
+bool Analyzer::processNarrowOopConversion(CallBase *CB) {
+  using namespace jeandle::pea;
+  bool IsEncode = isJeandleEncodeHeapOop(CB);
+  bool IsDecode = isJeandleDecodeHeapOop(CB);
+  if (!IsEncode && !IsDecode)
+    return false;
+  if (!isa<CallInst>(CB))
+    return false;
+  if (CB->arg_size() != 1)
+    return false;
+
+  auto ID =
+      resolveVirtualRef(CB->getArgOperand(0), CurrentState, Aliases, DL);
+  if (!ID)
+    return false;
+
+  Type *ArgTy = CB->getArgOperand(0)->getType();
+  Type *RetTy = CB->getType();
+  if (!ArgTy->isPointerTy() || !RetTy->isPointerTy())
+    return false;
+  unsigned ArgAS = ArgTy->getPointerAddressSpace();
+  unsigned RetAS = RetTy->getPointerAddressSpace();
+  if (IsEncode &&
+      (ArgAS != jeandle::AddrSpace::JavaHeapAddrSpace ||
+       RetAS != jeandle::AddrSpace::NarrowOopAddrSpace))
+    return false;
+  if (IsDecode &&
+      (ArgAS != jeandle::AddrSpace::NarrowOopAddrSpace ||
+       RetAS != jeandle::AddrSpace::JavaHeapAddrSpace))
+    return false;
+
+  if (auto Existing = Aliases.getVirtualAlias(CB)) {
+    assert(*Existing == *ID && "narrow-oop conversion changed object identity");
+  } else {
+    Aliases.addVirtualAlias(CB, *ID);
+  }
+
+  if (IsEncode) {
+    bool AlreadyTracked = false;
+    for (const WeakTrackingVH &VH : Result.NarrowOopEncodesToErase)
+      if (static_cast<Value *>(VH) == CB) {
+        AlreadyTracked = true;
+        break;
+      }
+    if (!AlreadyTracked)
+      Result.NarrowOopEncodesToErase.emplace_back(CB);
+    return true;
+  }
+
+  // Decoding a virtual narrow oop recovers the same wide virtual reference.
+  // Replace the representation conversion with the original wide allocation
+  // placeholder; the virtual alias above is what downstream analysis follows.
+  auto E = std::make_unique<jeandle::ReplaceCallEffect>();
+  E->Block = CB->getParent();
+  E->Target = CB;
+  E->Replacement = Result.VirtualObjects[*ID]->AllocationCall;
+  E->SeqNo = Result.nextSeqNo();
+  E->ObjID = *ID;
+  Result.addBlockEffect(std::move(E));
+  return true;
+}
+
 bool Analyzer::processJavaOp(CallBase *CB) {
   using namespace jeandle::pea;
   if (isJeandleArrayLength(CB))
@@ -5559,7 +5660,9 @@ void Analyzer::updateOtherStatesForMaterialized(
     for (auto &Entry : OtherKv.second) {
       if (Entry.second.isVirtualRef() &&
           Entry.second.getVirtualRef() == FlippedID) {
-        Entry.second = jeandle::FieldValue::materializedRef(NewPtr);
+        Type *DeclaredType = Entry.second.getDeclaredType();
+        Entry.second =
+            jeandle::FieldValue::materializedRef(NewPtr, DeclaredType);
       }
     }
   }
@@ -5766,6 +5869,7 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
         if (OffIt == It2->second.end() || !OffIt->second.isVirtualRef())
           continue;
         jeandle::ObjectID InnerID = OffIt->second.getVirtualRef();
+        Type *DeclaredType = OffIt->second.getDeclaredType();
         C.Recurse(InnerID, MatReason::Nested);
         // Record the inner's materialized (or kept-real) value for
         // field-replay. When the inner can no longer be materialized as a
@@ -5784,7 +5888,8 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
           InnerVal = realValueOfKeptReal(InnerID);
         else
           InnerVal = C.MaterializedValue(InnerID);
-        C.FieldStates[ID][Off] = jeandle::FieldValue::materializedRef(InnerVal);
+        C.FieldStates[ID][Off] =
+            jeandle::FieldValue::materializedRef(InnerVal, DeclaredType);
         // updateStatesForMaterialized: every other still-tracked object whose
         // FieldStates references InnerID must also flip to MaterializedRef.
         updateOtherStatesForMaterialized(InnerID, InnerVal, C.FieldStates);
@@ -7441,20 +7546,6 @@ PartialEscapeAnalysis::run(Function &F, FunctionAnalysisManager &FAM) {
   // (template module / runtime stubs are skipped).
   Module *M = F.getParent();
   if (!M || !M->getNamedMetadata(jeandle::Metadata::JavaMethodCompilation))
-    return jeandle::PEAResult();
-
-  // TODO(compressed-oop): PEA does not model narrow-oop (addrspace 3)
-  // reference fields yet — skip the whole analysis when the module's
-  // DataLayout describes a narrow-oop address space (the frontend appends
-  // p3:32:32:32 only when CompressedOops are configured; without a p3 spec
-  // getPointerSize(3) falls back to the default pointer size, equal to
-  // addrspace(1), and PEA runs normally). This is the load-bearing gate that
-  // keeps the DEFAULT VM configuration (compressed oops on) usable;
-  // getOrCreateFieldIndex separately bails per-access on non-addrspace(1)
-  // fields as defense in depth for hand-written / mixed IR.
-  const DataLayout &DL = M->getDataLayout();
-  if (DL.getPointerSize(jeandle::AddrSpace::NarrowOopAddrSpace) !=
-      DL.getPointerSize(jeandle::AddrSpace::JavaHeapAddrSpace))
     return jeandle::PEAResult();
 
   // Request DominatorTree and LoopInfo eagerly so they're cached for later
