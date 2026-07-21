@@ -1,12 +1,8 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Compressed-oops module gate: when the module DataLayout
-; describes a narrow-oop address space (p3 narrower than p1, as the frontend
-; emits under UseCompressedOops), PartialEscapeAnalysis returns an empty
-; result and PEA leaves the function completely untouched — even an
-; obviously-dead allocation survives. This keeps the DEFAULT VM
-; configuration (compressed oops on) correct until TODO(compressed-oop)
-; lands.
+; A p3 address space narrower than the Java heap address space no longer disables
+; PEA for the whole function. Even a compressed-oop module must eliminate an
+; otherwise unused allocation.
 
 target datalayout = "e-p:64:64:64-p1:64:64:64-p3:32:32:32"
 
@@ -27,9 +23,8 @@ unwind:
   resume i64 %lp
 }
 
-; PEA is idle on this module: the dead allocation invoke is retained verbatim.
 ; CHECK-LABEL: define void @test_unused_alloc()
-; CHECK: invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
+; CHECK-NOT: @jeandle.new_instance
 ; CHECK: ret void
 
 !java-method-compilation = !{}

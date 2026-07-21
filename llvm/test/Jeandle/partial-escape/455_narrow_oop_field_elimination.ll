@@ -1,12 +1,7 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Compressed-oops guard: a reference field stored as a
-; narrow oop (ptr addrspace(3)) must make getOrCreateFieldIndex bail
-; conservatively (-1) instead of asserting (debug) or mis-modeling the slot
-; at the wrong width (release). The allocation is kept real and the store
-; survives untouched. The module-level gate (PEA skips narrow-oop DataLayout
-; modules entirely) is covered by 456_narrow_oop_module_skip.ll; this test
-; covers the per-access defense for hand-written / mixed IR.
+; A narrow oop occupies four bytes in the field model. When the object is never
+; observed, PEA can eliminate both the allocation and the narrow field store.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare i32 @__gxx_personality_v0(...)
@@ -25,11 +20,9 @@ u:
   resume i64 %lp
 }
 
-; The allocation must survive (PEA keeps the object real) and the narrow-oop
-; store is left in place.
 ; CHECK-LABEL: define void @narrow_oop_field(
-; CHECK: invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
-; CHECK: store atomic ptr addrspace(3) %v, ptr addrspace(1) %f unordered, align 4
+; CHECK-NOT: @jeandle.new_instance
+; CHECK-NOT: store
 ; CHECK: ret void
 
 !java-method-compilation = !{}
