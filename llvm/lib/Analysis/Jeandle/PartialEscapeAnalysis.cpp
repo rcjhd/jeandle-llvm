@@ -234,22 +234,10 @@ struct BlockExitInfo : BlockExitData {
   // terminator is an InvokeInst (which has both a normal and an unwind
   // successor).
   //
-  // Jeandle's per-block analyzer processes the terminator-invoke last; the
-  // materialize Effects emitted by the invoke are physically inserted
-  // immediately before the invoke and survive on BOTH IR successors
-  // (definitional dominance). The state-split here is purely about which
-  // VirtualMap / FieldStates each successor INHERITS from the analyzer's
-  // book-keeping: the normal successor sees the post-call state (the base
-  // data of this struct), while the unwind successor sees the pre-call
-  // snapshot recorded in UnwindData (the materialize logically happened
-  // during the call, so on unwind any partially-materialized state is
-  // unobservable to the handler). EXCEPTION: a VO whose
-  // invoke-triggered materialize captured LOCKS re-acquires them BEFORE the
-  // invoke — a real side effect on BOTH edges. For such VOs the pre-call
-  // snapshot is patched to the materialized view (markUnwindDataMaterialized)
-  // so the handler cannot re-emit the same locks (double acquire) or lose
-  // the matching exit (lock leak). Field-only replay is idempotent and does
-  // not need the patch.
+  // Only an allocation invoke needs different normal and unwind object state:
+  // its result exists on the normal edge but not when the allocation throws.
+  // Ordinary invoke materialization is inserted before the call and is visible
+  // on both successors, so unwind must not inherit a stale virtual snapshot.
   //
   // TerminatorInvoke / UnwindDest are stashed so the analyzer's pred-state
   // lookup (exitDataFor) can detect "this pred's terminator is an invoke
@@ -264,13 +252,8 @@ struct BlockExitInfo : BlockExitData {
   // for a killed unwind edge, which makes the merge consumer treat the
   // pred as contributing nothing on that path (mark-as-dead).
   bool UnwindEdgeKilled = false;
-  // Pre-invoke snapshot of the per-object data. Captured by processBlock
-  // immediately before applying the terminator-invoke, then stashed here
-  // only if the post-invoke base data differs (i.e. the invoke actually
-  // changed some per-object state, e.g. by materializing an operand).
-  // When unset (and UnwindEdgeKilled is false), the unwind successor
-  // inherits the same base data as the normal successor (no state-split
-  // needed because the invoke was a no-op for PEA).
+  // Pre-allocation snapshot. It is captured only for an allocation invoke;
+  // ordinary invokes share post-call state on both successors.
   std::optional<BlockExitData> UnwindData;
 };
 
@@ -1289,20 +1272,12 @@ void Analyzer::processBlock(BasicBlock *BB) {
     mergeStates(BB);
   }
 
-  // Exception edge state splitting. If the block ends in an InvokeInst,
-  // snapshot the per-object state immediately BEFORE applying the invoke.
-  // The post-invoke state (the regular snapshotExitState below) is what
-  // the normal successor inherits; the snapshot we take here becomes the
-  // unwind successor's inheritance (the materialize logically happens
-  // during the call, so the handler should not see partially-materialized
-  // state).
-  //
-  // We only bother when the function has a personality (no personality =>
-  // no real exception handlers; the work would be observably inert) and
-  // the terminator actually IS an InvokeInst. Both conditions are required
-  // for state-splitting to matter.
+  // Only allocation invokes need distinct edge state: their result exists on
+  // the normal edge but not when the allocation throws. Ordinary invoke
+  // materialization is visible on both successors.
   InvokeInst *TermII = dyn_cast<InvokeInst>(BB->getTerminator());
-  bool MaybeSplit = TermII && F.hasPersonalityFn();
+  bool MaybeSplit = TermII && F.hasPersonalityFn() &&
+                    jeandle::pea::isJeandleAllocation(TermII);
   std::optional<BlockExitData> PreInvokeSnapshot;
   // Drain any VOs registered under MATERIALIZE_ALL in this
   // block, materialising each at the terminator IP. Called immediately
@@ -6510,9 +6485,12 @@ void Analyzer::processLoopExit(Loop *L) {
     Instruction *Term = ExitingBB->getTerminator();
     if (!Term)
       continue;
-    bool ExitsToEH = false;
+    DenseSet<jeandle::ObjectID> VirtualsOnObservableEHExits;
     for (BasicBlock *Succ : successors(ExitingBB)) {
       if (L->contains(Succ))
+        continue;
+      BlockExitData *EdgeExit = exitDataFor(ExitingBB, Succ);
+      if (!EdgeExit)
         continue;
       // Graal runs processLoopExit unconditionally for every LoopExitNode and
       // force-materializes every loop-local virtual whose exit reaches an
@@ -6534,20 +6512,20 @@ void Analyzer::processLoopExit(Loop *L) {
         if (auto *LP = dyn_cast<LandingPadInst>(First))
           PureOOMResume =
               LP->getNumClauses() == 0 && isPureResumeCleanup(*Succ);
-        if (!PureOOMResume) {
-          ExitsToEH = true;
-          break;
-        }
+        if (!PureOOMResume)
+          for (jeandle::ObjectID ID : EdgeExit->Virtuals)
+            VirtualsOnObservableEHExits.insert(ID);
       }
     }
-    if (!ExitsToEH)
+    if (VirtualsOnObservableEHExits.empty())
       continue;
     auto It = BlockExits.find(ExitingBB);
     if (It == BlockExits.end())
       continue;
     BlockExitInfo &Exit = It->second;
-    SmallVector<jeandle::ObjectID, 4> Vs(Exit.Virtuals.begin(),
-                                         Exit.Virtuals.end());
+    SmallVector<jeandle::ObjectID, 4> Vs(
+        VirtualsOnObservableEHExits.begin(),
+        VirtualsOnObservableEHExits.end());
     llvm::sort(Vs);
     for (jeandle::ObjectID ID : Vs) {
       if (!Eligible.lookup(ID))
