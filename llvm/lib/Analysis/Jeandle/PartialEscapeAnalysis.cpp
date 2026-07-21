@@ -1690,6 +1690,25 @@ Value *Analyzer::coerceToType(Value *V, Type *LoadTy,
   return nullptr;
 }
 
+// A virtual reference is represented by its wide allocation value while the
+// field that contains it may use a compressed oop. Field-PHI construction can
+// bridge exactly that representation change; every other type mismatch remains
+// unsupported.
+static bool canCoerceFieldPhiInput(Function &F, Type *FromTy, Type *PhiTy) {
+  if (FromTy == PhiTy)
+    return true;
+  auto *FromPtrTy = dyn_cast<PointerType>(FromTy);
+  auto *PhiPtrTy = dyn_cast<PointerType>(PhiTy);
+  if (!FromPtrTy || !PhiPtrTy ||
+      FromPtrTy->getAddressSpace() != jeandle::AddrSpace::JavaHeapAddrSpace ||
+      PhiPtrTy->getAddressSpace() != jeandle::AddrSpace::NarrowOopAddrSpace)
+    return false;
+  Function *Encode = F.getParent()->getFunction("jeandle.encode_heap_oop");
+  return Encode && Encode->arg_size() == 1 &&
+         Encode->getArg(0)->getType() == FromTy &&
+         Encode->getReturnType() == PhiTy;
+}
+
 Analyzer::MergeProcessor::MergeProcessor(Analyzer &A, BasicBlock *BB)
     : A(A), BB(BB), CurrentState(A.CurrentState), FieldStates(A.FieldStates),
       Eligible(A.Eligible), LockCounts(A.LockCounts),
@@ -2427,7 +2446,7 @@ bool Analyzer::MergeProcessor::mergeFieldStates(jeandle::ObjectID ID) {
           break;
         }
         In = FV.getMaterialized();
-        if (In->getType() != PhiType) {
+        if (!canCoerceFieldPhiInput(A.F, In->getType(), PhiType)) {
           LocalBail = true;
           break;
         }
@@ -2482,7 +2501,7 @@ bool Analyzer::MergeProcessor::mergeFieldStates(jeandle::ObjectID ID) {
         // just-materialized inner to MaterializedRef so a sibling successor
         // of the pred (other-than-BB) that later inherits from Preds[i] sees
         // the materialized pointer rather than a stale VirtualRef(InnerID).
-        if (InnerVal->getType() != PhiType) {
+        if (!canCoerceFieldPhiInput(A.F, InnerVal->getType(), PhiType)) {
           LocalBail = true;
           break;
         }
@@ -3227,7 +3246,7 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
           return false;
         }
         In = FV.getMaterialized();
-        if (In->getType() != P.PhiType) {
+        if (!canCoerceFieldPhiInput(F, In->getType(), P.PhiType)) {
           Eligible[NewID] = false;
           return false;
         }
@@ -3238,7 +3257,8 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
         }
         jeandle::ObjectID InnerID = FV.getVirtualRef();
         jeandle::VirtualObject &InnerVO = *Result.VirtualObjects[InnerID];
-        if (InnerVO.AllocationCall->getType() != P.PhiType) {
+        if (!canCoerceFieldPhiInput(F, InnerVO.AllocationCall->getType(),
+                                    P.PhiType)) {
           Eligible[NewID] = false;
           return false;
         }

@@ -651,8 +651,17 @@ void jeandle::CreatePHIEffect::apply(jeandle::TransformContext &Ctx) {
          "CreatePHI's PhiInst must be unparented at apply time");
   Phi->insertBefore(Block->getFirstInsertionPt());
   assert(PHIIncomingValues.size() == PHIIncomingBlocks.size());
-  for (unsigned I = 0; I < PHIIncomingValues.size(); ++I)
-    Phi->addIncoming(PHIIncomingValues[I], PHIIncomingBlocks[I]);
+  for (unsigned I = 0; I < PHIIncomingValues.size(); ++I) {
+    BasicBlock *Pred = PHIIncomingBlocks[I];
+    Value *V = PHIIncomingValues[I];
+
+    // Virtual references remain wide allocation values in analysis even when
+    // the field is compressed. Encode on the incoming edge before wiring the
+    // narrow field PHI.
+    IRBuilder<> B(Pred->getTerminator());
+    V = coerceMaterializedFieldValue(B, V, Phi->getType());
+    Phi->addIncoming(V, Pred);
+  }
   Ctx.Changed = true;
 }
 
