@@ -256,7 +256,7 @@ public:
 
   static FieldValue unknown() { return {}; }
 
-  static FieldValue scalar(Value *V);
+  static FieldValue scalar(Value *V, Type *DeclaredType = nullptr);
   static FieldValue virtualRef(ObjectID ID, Type *RefTy);
   static FieldValue materializedRef(Value *Ptr, Type *DeclaredType = nullptr);
 

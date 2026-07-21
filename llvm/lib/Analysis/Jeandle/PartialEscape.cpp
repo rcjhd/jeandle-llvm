@@ -289,12 +289,12 @@ std::unique_ptr<VirtualObject> VirtualObject::duplicate() const {
 // FieldValue
 // ===========================================================================
 
-FieldValue FieldValue::scalar(Value *V) {
+FieldValue FieldValue::scalar(Value *V, Type *DeclaredType) {
   assert(V && "scalar value must be non-null");
   FieldValue F;
   F.T = Scalar;
   F.V = V;
-  F.DeclaredType = V->getType();
+  F.DeclaredType = DeclaredType ? DeclaredType : V->getType();
   return F;
 }
 

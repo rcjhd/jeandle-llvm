@@ -4033,7 +4033,29 @@ bool Analyzer::processStore(StoreInst *SI) {
     Result.addBlockEffect(std::move(E));
     return true;
   }
-  FieldStates[*BaseID][*Offset] = jeandle::FieldValue::scalar(Val);
+
+  Value *StoredVal = Val;
+  Type *DeclaredType = StoredVal->getType();
+
+  // A deopt descriptor must carry a GC-trackable wide oop, even when the
+  // physical field stores its compressed representation. Keep the narrow
+  // declared type for normal loads and materialization replay, but snapshot
+  // the dominating wide encoder input.
+  if (auto *Encode = dyn_cast<CallBase>(StoredVal);
+      Encode && jeandle::pea::isJeandleEncodeHeapOop(Encode) &&
+      Encode->arg_size() == 1) {
+    Value *Wide = Encode->getArgOperand(0);
+    auto *WideTy = dyn_cast<PointerType>(Wide->getType());
+    auto *NarrowTy = dyn_cast<PointerType>(DeclaredType);
+    if (WideTy && NarrowTy &&
+        WideTy->getAddressSpace() ==
+            jeandle::AddrSpace::JavaHeapAddrSpace &&
+        NarrowTy->getAddressSpace() ==
+            jeandle::AddrSpace::NarrowOopAddrSpace)
+      Val = Wide;
+  }
+  FieldStates[*BaseID][*Offset] =
+      jeandle::FieldValue::scalar(Val, DeclaredType);
 
   auto E = std::make_unique<jeandle::EliminateStoreEffect>();
   E->Block = SI->getParent();
@@ -5260,10 +5282,11 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
   //     virtual) wide oop (addrspace 1) that is not a non-null constant —
   //     emitted as a live-oop field value that RS4GC keeps GC-live/relocatable
   //     and HotSpot's fill_one_scope_value T_OBJECT non-constant branch reads
-  //     back as LocationValue(Location::oop);
+  //     back as LocationValue(Location::oop). A compressed field stores its
+  //     wide encoder input in FieldValue while preserving the narrow declared
+  //     type, so it follows this same path.
   //   - Bad otherwise: a MaterializedRef/Unknown whose value fails the
-  //     describable-oop test, a narrow-oop (addrspace 3) reference field
-  //     (CompressedOops deferred), or a non-null constant oop (would trip
+  //     describable-oop test, or a non-null constant oop (would trip
   //     fill_one_scope_value's ShouldNotReachHere on a stackmap constant; null
   //     is fine). A VO with any Bad cell is wholly undescribable.
   // A describable oop field value's def dominates the safepoint for free under
@@ -5312,9 +5335,8 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
         C.ScalarV = SV;
       } else if (FV.getDeclaredType() &&
                  FV.getDeclaredType()->isPointerTy()) {
-        // Narrow-oop (addrspace 3) reference field, or a non-null constant
-        // oop: not describable. TODO(compressed-oop): narrow-oop reference
-        // fields are explicitly deferred (do NOT add handling).
+        // A pointer field whose backing value is not a live wide oop cannot be
+        // encoded in the lazy-object descriptor.
         C.Kind = Cell::Bad;
       } else {
         // Plain primitive scalar (int/float/long/double; also byte/char/short
